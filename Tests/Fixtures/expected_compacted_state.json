@@ -1,0 +1,30 @@
+{
+  "stableFacts": [
+    {
+      "key": "Project",
+      "value": "LanguageModelContextKit"
+    }
+  ],
+  "userConstraints": [
+    "We must preserve user constraints"
+  ],
+  "openTasks": [
+    {
+      "description": "TODO: add README examples",
+      "status": "open"
+    }
+  ],
+  "decisions": [
+    {
+      "summary": "We decided to use Swift concurrency actors"
+    }
+  ],
+  "entities": [],
+  "blobReferences": [
+    {
+      "id": "44444444-4444-4444-4444-444444444444",
+      "reason": "Referenced from tool turn"
+    }
+  ],
+  "retrievalHints": []
+}

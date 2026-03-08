@@ -1,0 +1,35 @@
+[
+  {
+    "id": "11111111-1111-1111-1111-111111111111",
+    "role": "user",
+    "text": "Project: LanguageModelContextKit. We must preserve user constraints. TODO: add README examples.",
+    "createdAt": "2026-03-07T10:00:00Z",
+    "priority": 950,
+    "tags": ["prompt"],
+    "blobIDs": [],
+    "windowIndex": 0,
+    "compacted": false
+  },
+  {
+    "id": "22222222-2222-2222-2222-222222222222",
+    "role": "assistant",
+    "text": "We decided to use Swift concurrency actors. The package name is `LanguageModelContextKit`.",
+    "createdAt": "2026-03-07T10:00:30Z",
+    "priority": 800,
+    "tags": ["response"],
+    "blobIDs": [],
+    "windowIndex": 0,
+    "compacted": false
+  },
+  {
+    "id": "33333333-3333-3333-3333-333333333333",
+    "role": "tool",
+    "text": "Tool payload stored externally",
+    "createdAt": "2026-03-07T10:01:00Z",
+    "priority": 250,
+    "tags": ["tool"],
+    "blobIDs": ["44444444-4444-4444-4444-444444444444"],
+    "windowIndex": 0,
+    "compacted": false
+  }
+]
