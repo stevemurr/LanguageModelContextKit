@@ -13,11 +13,7 @@
 Add the package to your SwiftPM dependencies:
 
 ```swift
-.package(
-    name: "LanguageModelContextKit",
-    url: "https://github.com/stevemurr/LanguageModelContextKit.git",
-    branch: "main"
-)
+.package(url: "https://github.com/stevemurr/LanguageModelContextKit.git", branch: "main")
 ```
 
 Then depend on the product:
@@ -79,6 +75,7 @@ Use `respondManaged` when you need structured output plus persisted metadata:
 
 ```swift
 import FoundationModels
+import LanguageModelContextKit
 
 @Generable(description: "A compact project summary.")
 struct ProjectSummary {
@@ -105,6 +102,12 @@ print(managed.budget.projectedTotalTokens)
 ```
 
 `respond(to:generating:threadID:includeSchemaInPrompt:transcriptRenderer:)` remains available as a convenience wrapper that returns only `managed.content`.
+
+Managed structured responses include:
+
+- `content` for the typed payload
+- `transcriptText` for the adapter-rendered transcript/debug view
+- `budget`, `compaction`, and `bridge` metadata for the completed turn
 
 ## Streaming
 
@@ -236,7 +239,7 @@ try await kit.importThread(
 ```
 
 Imported turns are sorted by `createdAt`, existing `windowIndex` values are preserved, persisted durable memory is written through the configured memory store, and any live in-memory session is invalidated so the next call rehydrates from imported state.
-Re-importing the same imported records is idempotent for matching turns and durable memories.
+With `replaceExisting: false`, imported state is merged into the existing thread and repeated imports of the same turns or durable memories are deduplicated.
 
 ## External Mutations and Inspection
 
@@ -253,11 +256,16 @@ print(state.turns.count)
 print(memories.count)
 ```
 
-Appending turns or memories does not trigger compaction. It updates persisted thread timestamps and invalidates any live session so the next generation request rehydrates cleanly.
+Appending turns or memories does not trigger compaction. It updates persisted thread timestamps and invalidates any live session so the next generation request rehydrates cleanly. `appendMemories` deduplicates by `kind + text` by default; pass `deduplicate: false` if you need exact duplicates preserved.
+
+## Budgeting Notes
+
+`estimateBudget` and the managed response metadata use the package token counter. When Foundation Models does not expose a runtime context-window value, LMCK uses `BudgetPolicy.defaultContextWindowTokens` as the window-size fallback for planning and diagnostics.
 
 ## Notes
 
 - Call `openThread` after app launch or resume for any thread that uses tools, because tool implementations are runtime-only.
+- After relaunch, call `openThread` again for persisted threads so runtime configuration such as tools is reattached before the next model request.
 - The library persists normalized turns and durable memories, not Foundation transcript objects.
 - Structured calls persist assistant text from `transcriptRenderer(content)` when provided; otherwise they persist the adapter transcript text.
 - Exact budgeting still falls back to heuristics today because Foundation Models does not currently expose public token-count or context-window APIs that the package can bind to.
