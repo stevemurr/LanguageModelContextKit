@@ -214,12 +214,74 @@ actor AppleSessionHandle: SessionHandle {
             )
             return SessionStructuredResult(
                 content: response.content,
-                transcriptText: String(describing: response.rawContent)
+                transcriptText: response.rawContent.jsonString
             )
         } catch let error as LanguageModelSession.GenerationError {
             throw map(error)
         } catch {
             throw SessionFailure.generationFailed(error.localizedDescription)
+        }
+    }
+
+    func streamStructured<Content: Generable>(
+        to prompt: String,
+        generating type: Content.Type,
+        includeSchemaInPrompt: Bool,
+        maximumResponseTokens: Int?
+    ) async -> AsyncThrowingStream<SessionStructuredStreamEvent<Content>, Error> {
+        AsyncThrowingStream { continuation in
+            let stream = session.streamResponse(
+                to: prompt,
+                generating: type,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: GenerationOptions(maximumResponseTokens: maximumResponseTokens)
+            )
+
+            let task = Task {
+                do {
+                    var finalRawContent: GeneratedContent?
+
+                    for try await snapshot in stream {
+                        try Task.checkCancellation()
+                        finalRawContent = snapshot.rawContent
+                        continuation.yield(
+                            .partial(
+                                SessionStructuredStreamPartial(
+                                    content: snapshot.content,
+                                    transcriptText: snapshot.rawContent.jsonString,
+                                    rawContent: snapshot.rawContent
+                                )
+                            )
+                        )
+                    }
+
+                    guard let finalRawContent, finalRawContent.isComplete else {
+                        throw SessionFailure.generationFailed("Streaming finished without final content")
+                    }
+
+                    continuation.yield(
+                        .completed(
+                            SessionStructuredResult(
+                                content: try Content(finalRawContent),
+                                transcriptText: finalRawContent.jsonString
+                            )
+                        )
+                    )
+                    continuation.finish()
+                } catch let error as LanguageModelSession.GenerationError {
+                    continuation.finish(throwing: map(error))
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch let error as SessionFailure {
+                    continuation.finish(throwing: error)
+                } catch {
+                    continuation.finish(throwing: SessionFailure.generationFailed(error.localizedDescription))
+                }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
         }
     }
 

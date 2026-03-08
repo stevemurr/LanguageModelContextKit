@@ -76,6 +76,17 @@ enum ModelAvailability: Sendable, Equatable {
     case unavailable(String)
 }
 
+extension ModelAvailability {
+    var publicStatus: AvailabilityStatus {
+        switch self {
+        case .available:
+            return .available
+        case .unavailable(let reason):
+            return .unavailable(reason: reason)
+        }
+    }
+}
+
 enum SessionFailure: Error, Sendable, Equatable {
     case exceededContextWindowSize(String)
     case unsupportedLocale(String)
@@ -92,6 +103,17 @@ struct SessionStructuredResult<Content: Generable>: @unchecked Sendable {
     var transcriptText: String
 }
 
+struct SessionStructuredStreamPartial<Content: Generable>: @unchecked Sendable {
+    var content: Content.PartiallyGenerated
+    var transcriptText: String
+    var rawContent: GeneratedContent
+}
+
+enum SessionStructuredStreamEvent<Content: Generable>: @unchecked Sendable {
+    case partial(SessionStructuredStreamPartial<Content>)
+    case completed(SessionStructuredResult<Content>)
+}
+
 protocol SessionHandle: Sendable {
     func respondText(to prompt: String, maximumResponseTokens: Int?) async throws -> SessionTextResult
     func respondStructured<Content: Generable>(
@@ -100,6 +122,12 @@ protocol SessionHandle: Sendable {
         includeSchemaInPrompt: Bool,
         maximumResponseTokens: Int?
     ) async throws -> SessionStructuredResult<Content>
+    func streamStructured<Content: Generable>(
+        to prompt: String,
+        generating type: Content.Type,
+        includeSchemaInPrompt: Bool,
+        maximumResponseTokens: Int?
+    ) async -> AsyncThrowingStream<SessionStructuredStreamEvent<Content>, Error>
 }
 
 protocol SessionDriving: Sendable {
@@ -130,4 +158,9 @@ extension PersistedThreadState {
     var locale: Locale? {
         localeIdentifier.map(Locale.init(identifier:))
     }
+}
+
+@Generable(description: "Plain-text assistant response wrapper. Return the assistant response in the text field.")
+struct GeneratedTextEnvelope {
+    var text: String
 }

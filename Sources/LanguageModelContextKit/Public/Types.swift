@@ -71,6 +71,27 @@ public struct ModelPolicy: Codable, Sendable, Equatable {
     public static let `default` = ModelPolicy()
 }
 
+public enum AvailabilityStatus: Sendable, Equatable {
+    case available
+    case unavailable(reason: String)
+
+    public var isAvailable: Bool {
+        if case .available = self {
+            return true
+        }
+        return false
+    }
+
+    public var reason: String? {
+        switch self {
+        case .available:
+            return nil
+        case .unavailable(let reason):
+            return reason
+        }
+    }
+}
+
 public struct BudgetPolicy: Sendable, Equatable {
     public var reservedOutputTokens: Int
     public var preemptiveCompactionFraction: Double
@@ -209,6 +230,38 @@ public struct ManagedTextResponse: Sendable {
         self.compaction = compaction
         self.bridge = bridge
     }
+}
+
+public struct ManagedStructuredResponse<Content: Generable>: @unchecked Sendable {
+    public let content: Content
+    public let transcriptText: String
+    public let budget: BudgetReport
+    public let compaction: CompactionReport?
+    public let bridge: BridgeReport?
+
+    public init(
+        content: Content,
+        transcriptText: String,
+        budget: BudgetReport,
+        compaction: CompactionReport?,
+        bridge: BridgeReport?
+    ) {
+        self.content = content
+        self.transcriptText = transcriptText
+        self.budget = budget
+        self.compaction = compaction
+        self.bridge = bridge
+    }
+}
+
+public enum ManagedTextStreamEvent: Sendable {
+    case partial(text: String)
+    case completed(ManagedTextResponse)
+}
+
+public enum ManagedStructuredStreamEvent<Content: Generable>: @unchecked Sendable {
+    case partial(content: Content.PartiallyGenerated, transcriptText: String)
+    case completed(ManagedStructuredResponse<Content>)
 }
 
 public struct BudgetReport: Codable, Sendable, Equatable {

@@ -135,6 +135,42 @@ struct LanguageModelContextKitIntegrationTests {
         #expect(payload.message.isEmpty == false)
     }
 
+    @Test("Structured streaming integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
+    func structuredStreaming() async throws {
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            )
+        )
+
+        try await kit.openThread(
+            id: "integration-structured-stream-thread",
+            configuration: ThreadConfiguration(instructions: "Return concise structured content.")
+        )
+
+        var sawPartial = false
+        var completed: ManagedStructuredResponse<GreetingPayload>?
+
+        for try await event in await kit.streamManaged(
+            to: "Return a greeting of six to ten words in the message field.",
+            generating: GreetingPayload.self,
+            threadID: "integration-structured-stream-thread"
+        ) {
+            switch event {
+            case .partial:
+                sawPartial = true
+            case .completed(let response):
+                completed = response
+            }
+        }
+
+        let state = try await kit.threadState(threadID: "integration-structured-stream-thread")
+        #expect(sawPartial)
+        #expect(completed?.content.message.isEmpty == false)
+        #expect(completed?.budget.estimatedInputTokens ?? 0 > 0)
+        #expect(state.turns.count == 2)
+    }
+
     @Test("Manual compaction integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
     func manualCompaction() async throws {
         let kit = LanguageModelContextKit(
@@ -254,6 +290,132 @@ struct LanguageModelContextKitIntegrationTests {
                 threadID: "integration-overflow-thread"
             )
             Issue.record("Expected budget exhaustion after overflow retry")
+        } catch let error as LanguageModelContextKitError {
+            switch error {
+            case .budgetExhausted(let diagnostics):
+                #expect(diagnostics.windowIndex >= 1)
+                #expect(diagnostics.lastBridge?.reason == "exceededContextWindowSize")
+            case .exceededBudget(let budget):
+                #expect(budget.projectedTotalTokens > budget.contextWindowTokens)
+            default:
+                Issue.record("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    @Test("Imported thread continuity integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
+    func importedThreadContinuity() async throws {
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            )
+        )
+
+        try await kit.importThread(
+            id: "integration-import-thread",
+            configuration: ThreadConfiguration(
+                instructions: "Answer with the imported workspace label only."
+            ),
+            turns: [
+                NormalizedTurn(
+                    role: .user,
+                    text: "Workspace label: Lattice Harbor.",
+                    createdAt: Date(timeIntervalSince1970: 10),
+                    priority: 950,
+                    windowIndex: 0
+                ),
+                NormalizedTurn(
+                    role: .assistant,
+                    text: "Stored: workspace label is Lattice Harbor.",
+                    createdAt: Date(timeIntervalSince1970: 20),
+                    priority: 800,
+                    windowIndex: 0
+                )
+            ],
+            durableMemory: [
+                DurableMemoryRecord(
+                    kind: .fact,
+                    text: "Workspace label: Lattice Harbor",
+                    priority: 900
+                )
+            ],
+            replaceExisting: true
+        )
+
+        let response = try await kit.respond(
+            to: "What is the workspace label? Reply with only the label.",
+            threadID: "integration-import-thread"
+        )
+
+        let state = try await kit.threadState(threadID: "integration-import-thread")
+        #expect(response.text.contains("Lattice Harbor"))
+        #expect(state.turns.count == 4)
+    }
+
+    @Test("Overflow retry after imported and appended state", .disabled(if: !SystemLanguageModel.default.isAvailable))
+    func overflowRetryAfterImportedAndAppendedState() async throws {
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                budget: BudgetPolicy(
+                    reservedOutputTokens: 64,
+                    preemptiveCompactionFraction: 0.95,
+                    emergencyFraction: 0.99,
+                    maxBridgeRetries: 1,
+                    exactCountingPreferred: true,
+                    heuristicSafetyMultiplier: 1.10,
+                    defaultContextWindowTokens: 4096
+                ),
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            )
+        )
+
+        try await kit.importThread(
+            id: "integration-overflow-imported-thread",
+            configuration: ThreadConfiguration(
+                instructions: "If possible, answer in one short sentence."
+            ),
+            turns: [
+                NormalizedTurn(
+                    role: .user,
+                    text: "Imported context before overflow.",
+                    createdAt: Date(timeIntervalSince1970: 10),
+                    priority: 950,
+                    windowIndex: 0
+                )
+            ],
+            durableMemory: [
+                DurableMemoryRecord(
+                    kind: .fact,
+                    text: "Imported fact before overflow",
+                    priority: 900
+                )
+            ],
+            replaceExisting: true
+        )
+        try await kit.appendTurns(
+            [
+                NormalizedTurn(
+                    role: .tool,
+                    text: "Appended external tool output before overflow.",
+                    priority: 250,
+                    tags: ["tool"],
+                    windowIndex: 0
+                )
+            ],
+            threadID: "integration-overflow-imported-thread"
+        )
+
+        let oversizedPrompt = Array(
+            repeating: "context-window-overflow-check repeated filler text",
+            count: 2500
+        ).joined(separator: " ")
+
+        do {
+            _ = try await kit.respond(
+                to: oversizedPrompt,
+                threadID: "integration-overflow-imported-thread"
+            )
+            Issue.record("Expected budget exhaustion after overflow retry with imported state")
         } catch let error as LanguageModelContextKitError {
             switch error {
             case .budgetExhausted(let diagnostics):

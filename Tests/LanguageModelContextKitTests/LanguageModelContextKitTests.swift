@@ -5,6 +5,20 @@ import Testing
 
 @Suite("LanguageModelContextKit")
 struct LanguageModelContextKitTests {
+    @Test("Availability and locale support APIs")
+    func availabilityAndLocaleSupport() async throws {
+        let unavailableKit = makeKit(
+            driver: FakeSessionDriver(availabilityValue: .unavailable("model unavailable"))
+        )
+        let localeKit = makeKit(driver: FakeSessionDriver(localeSupported: false))
+
+        let availability = await unavailableKit.availabilityStatus()
+        let localeSupport = await localeKit.supportsLocale(Locale(identifier: "fr_FR"))
+
+        #expect(availability == .unavailable(reason: "model unavailable"))
+        #expect(localeSupport == false)
+    }
+
     @Test("Open thread and estimate budget")
     func estimateBudget() async throws {
         let driver = FakeSessionDriver()
@@ -82,6 +96,172 @@ struct LanguageModelContextKitTests {
         let diagnostics = await kit.diagnostics(threadID: "thread-3")
         #expect(value == "Structured output")
         #expect(diagnostics?.turnCount == 2)
+    }
+
+    @Test("Managed structured response returns metadata")
+    func respondManagedMetadata() async throws {
+        let state = FakeDriverState(
+            sessions: [
+                ScriptedSessionHandle(
+                    structuredResponses: ["Structured output"],
+                    structuredTranscriptTexts: ["{\"value\":\"Structured output\"}"]
+                )
+            ]
+        )
+        let driver = FakeSessionDriver(state: state)
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-managed-response",
+            configuration: ThreadConfiguration(instructions: "Generate structured responses.")
+        )
+
+        let response = try await kit.respondManaged(
+            to: "Return structured output",
+            generating: String.self,
+            threadID: "thread-managed-response"
+        )
+
+        #expect(response.content == "Structured output")
+        #expect(response.transcriptText == "{\"value\":\"Structured output\"}")
+        #expect(response.budget.estimatedInputTokens > 0)
+        #expect(response.compaction == nil)
+        #expect(response.bridge == nil)
+    }
+
+    @Test("Structured persistence uses transcript renderer")
+    func structuredTranscriptRendererPersistence() async throws {
+        let state = FakeDriverState(
+            sessions: [
+                ScriptedSessionHandle(
+                    structuredResponses: ["Structured output"],
+                    structuredTranscriptTexts: ["{\"value\":\"Structured output\"}"]
+                )
+            ]
+        )
+        let driver = FakeSessionDriver(state: state)
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-structured-renderer",
+            configuration: ThreadConfiguration(instructions: "Render transcript text explicitly.")
+        )
+
+        _ = try await kit.respondManaged(
+            to: "Return structured output",
+            generating: String.self,
+            threadID: "thread-structured-renderer",
+            transcriptRenderer: { value in
+                "Rendered: \(value)"
+            }
+        )
+
+        let stateAfterResponse = try await kit.threadState(threadID: "thread-structured-renderer")
+        #expect(stateAfterResponse.turns.last?.text == "Rendered: Structured output")
+    }
+
+    @Test("Managed structured streaming yields partial and final events")
+    func streamManagedEvents() async throws {
+        let state = FakeDriverState(
+            sessions: [
+                ScriptedSessionHandle(
+                    structuredStreamScripts: [
+                        ScriptedStructuredStream(
+                            partials: ["Hel", "Hello"],
+                            partialTranscriptTexts: ["\"Hel\"", "\"Hello\""],
+                            partialRawContents: [GeneratedContent("Hel"), GeneratedContent("Hello")],
+                            finalContent: "Hello",
+                            finalTranscriptText: "\"Hello\""
+                        )
+                    ]
+                )
+            ]
+        )
+        let driver = FakeSessionDriver(state: state)
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-structured-stream",
+            configuration: ThreadConfiguration(instructions: "Stream structured responses.")
+        )
+
+        var partialTranscriptTexts: [String] = []
+        var completedResponse: ManagedStructuredResponse<String>?
+
+        for try await event in await kit.streamManaged(
+            to: "Stream a response",
+            generating: String.self,
+            threadID: "thread-structured-stream"
+        ) {
+            switch event {
+            case .partial(_, let transcriptText):
+                partialTranscriptTexts.append(transcriptText)
+            case .completed(let response):
+                completedResponse = response
+            }
+        }
+
+        let persisted = try await kit.threadState(threadID: "thread-structured-stream")
+        #expect(partialTranscriptTexts == ["\"Hel\"", "\"Hello\""])
+        #expect(completedResponse?.content == "Hello")
+        #expect(completedResponse?.transcriptText == "\"Hello\"")
+        #expect(completedResponse?.budget.estimatedInputTokens ?? 0 > 0)
+        #expect(persisted.turns.count == 2)
+        #expect(persisted.turns.last?.text == "\"Hello\"")
+    }
+
+    @Test("Stream cancellation does not persist completed assistant turn")
+    func streamCancellation() async throws {
+        let state = FakeDriverState(
+            sessions: [
+                ScriptedSessionHandle(
+                    structuredStreamScripts: [
+                        ScriptedStructuredStream(
+                            partials: [GeneratedTextEnvelope(text: "Hel")],
+                            partialTranscriptTexts: ["{\"text\":\"Hel\"}"],
+                            partialRawContents: [try GeneratedContent(json: "{\"text\":\"Hel\"}")],
+                            finalContent: GeneratedTextEnvelope(text: "Hello"),
+                            finalTranscriptText: "{\"text\":\"Hello\"}",
+                            stepDelayNanoseconds: 250_000_000
+                        )
+                    ]
+                )
+            ]
+        )
+        let driver = FakeSessionDriver(state: state)
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-stream-cancel",
+            configuration: ThreadConfiguration(instructions: "Stream plain text.")
+        )
+
+        let partialProbe = StreamProbe()
+        let task = Task {
+            do {
+                for try await event in await kit.streamText(
+                    to: "Stream text",
+                    threadID: "thread-stream-cancel"
+                ) {
+                    if case .partial(let text) = event {
+                        await partialProbe.record(text)
+                    }
+                }
+            } catch {
+                // Expected when the consumer cancels mid-stream.
+            }
+        }
+
+        for _ in 0..<200 where await partialProbe.lastValue() == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await partialProbe.lastValue() == "Hel")
+
+        task.cancel()
+        _ = await task.result
+
+        let stateAfterCancellation = try await kit.threadState(threadID: "thread-stream-cancel")
+        #expect(stateAfterCancellation.turns.isEmpty)
     }
 
     @Test("Overflow triggers bridge and retry")
@@ -605,6 +785,180 @@ struct LanguageModelContextKitTests {
         }
     }
 
+    @Test("Imported thread continues with respond")
+    func importThreadContinuation() async throws {
+        let state = FakeDriverState(
+            sessions: [
+                ScriptedSessionHandle(textResponses: [.success("Continued response")])
+            ]
+        )
+        let driver = FakeSessionDriver(state: state)
+        let kit = makeKit(driver: driver)
+        let importedTurns = [
+            NormalizedTurn(
+                role: .user,
+                text: "Earlier question",
+                createdAt: Date(timeIntervalSince1970: 10),
+                priority: 950,
+                windowIndex: 0
+            ),
+            NormalizedTurn(
+                role: .assistant,
+                text: "Earlier answer",
+                createdAt: Date(timeIntervalSince1970: 20),
+                priority: 800,
+                windowIndex: 0
+            )
+        ]
+        let importedMemories = [
+            DurableMemoryRecord(
+                kind: .fact,
+                text: "Imported fact",
+                priority: 900
+            )
+        ]
+
+        try await kit.importThread(
+            id: "thread-import",
+            configuration: ThreadConfiguration(instructions: "Continue imported context."),
+            turns: importedTurns,
+            durableMemory: importedMemories,
+            replaceExisting: true
+        )
+
+        let importedState = try await kit.threadState(threadID: "thread-import")
+        #expect(importedState.turns.map(\.text) == ["Earlier question", "Earlier answer"])
+        #expect(importedState.lastBudget == nil)
+        #expect(importedState.lastCompaction == nil)
+        #expect(importedState.lastBridge == nil)
+
+        let response = try await kit.respond(
+            to: "Follow up",
+            threadID: "thread-import"
+        )
+
+        let seeds = await state.recordedSeeds()
+        let finalState = try await kit.threadState(threadID: "thread-import")
+        #expect(response.text == "Continued response")
+        #expect(seeds.count == 1)
+        #expect(seeds[0].instructions?.contains("Earlier answer") == true)
+        #expect(finalState.turns.count == 4)
+    }
+
+    @Test("Appending turns invalidates live session and preserves continuity")
+    func appendTurnsInvalidatesLiveSession() async throws {
+        let state = FakeDriverState(
+            sessions: [
+                ScriptedSessionHandle(textResponses: [.success("First response")]),
+                ScriptedSessionHandle(textResponses: [.success("Second response")])
+            ]
+        )
+        let driver = FakeSessionDriver(state: state)
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-append-turns",
+            configuration: ThreadConfiguration(instructions: "Preserve continuity after external turns.")
+        )
+
+        _ = try await kit.respond(
+            to: "First prompt",
+            threadID: "thread-append-turns"
+        )
+
+        try await kit.appendTurns(
+            [
+                NormalizedTurn(
+                    role: .tool,
+                    text: "External tool result",
+                    priority: 250,
+                    tags: ["tool"],
+                    windowIndex: 0
+                )
+            ],
+            threadID: "thread-append-turns"
+        )
+
+        _ = try await kit.respond(
+            to: "Second prompt",
+            threadID: "thread-append-turns"
+        )
+
+        let seeds = await state.recordedSeeds()
+        let finalState = try await kit.threadState(threadID: "thread-append-turns")
+        #expect(seeds.count == 2)
+        #expect(seeds[1].instructions?.contains("External tool result") == true)
+        #expect(seeds[1].instructions?.contains("First response") == true)
+        #expect(finalState.turns.count == 5)
+    }
+
+    @Test("Appending memories deduplicates by kind and text")
+    func appendMemoriesDeduplicates() async throws {
+        let kit = makeKit(driver: FakeSessionDriver())
+
+        try await kit.openThread(
+            id: "thread-append-memories",
+            configuration: ThreadConfiguration(instructions: "Record durable memories.")
+        )
+
+        try await kit.appendMemories(
+            [
+                DurableMemoryRecord(kind: .fact, text: "Same fact", priority: 900),
+                DurableMemoryRecord(kind: .decision, text: "Same fact", priority: 500)
+            ],
+            threadID: "thread-append-memories"
+        )
+        try await kit.appendMemories(
+            [
+                DurableMemoryRecord(kind: .fact, text: "Same fact", priority: 100),
+                DurableMemoryRecord(kind: .fact, text: "New fact", priority: 400)
+            ],
+            threadID: "thread-append-memories"
+        )
+
+        let memories = try await kit.durableMemories(threadID: "thread-append-memories")
+        #expect(memories.count == 3)
+        #expect(memories.contains { $0.kind == .fact && $0.text == "Same fact" })
+        #expect(memories.contains { $0.kind == .decision && $0.text == "Same fact" })
+        #expect(memories.contains { $0.kind == .fact && $0.text == "New fact" })
+    }
+
+    @Test("Inspection APIs return persisted state")
+    func inspectionApis() async throws {
+        let kit = makeKit(driver: FakeSessionDriver())
+        let importedTurns = [
+            NormalizedTurn(
+                role: .user,
+                text: "Imported turn",
+                createdAt: Date(timeIntervalSince1970: 1),
+                priority: 950,
+                windowIndex: 2
+            )
+        ]
+        let importedMemories = [
+            DurableMemoryRecord(
+                kind: .fact,
+                text: "Imported memory",
+                priority: 900
+            )
+        ]
+
+        try await kit.importThread(
+            id: "thread-inspection",
+            configuration: ThreadConfiguration(instructions: "Inspect imported state."),
+            turns: importedTurns,
+            durableMemory: importedMemories,
+            replaceExisting: true
+        )
+
+        let state = try await kit.threadState(threadID: "thread-inspection")
+        let memories = try await kit.durableMemories(threadID: "thread-inspection")
+        #expect(state.turns.count == 1)
+        #expect(state.activeWindowIndex == 2)
+        #expect(memories.count == 1)
+        #expect(memories.first?.text == "Imported memory")
+    }
+
     @Test("Keyword retriever ranks overlapping memories")
     func keywordRetriever() async throws {
         let store = InMemoryMemoryStore()
@@ -796,15 +1150,18 @@ private actor ScriptedSessionHandle: SessionHandle {
     private var textResponses: [Result<String, SessionFailure>]
     private var structuredResponses: [Any]
     private var structuredTranscriptTexts: [String]
+    private var structuredStreamScripts: [ScriptedStructuredStream]
 
     init(
         textResponses: [Result<String, SessionFailure>] = [],
         structuredResponses: [Any] = [],
-        structuredTranscriptTexts: [String] = []
+        structuredTranscriptTexts: [String] = [],
+        structuredStreamScripts: [ScriptedStructuredStream] = []
     ) {
         self.textResponses = textResponses
         self.structuredResponses = structuredResponses
         self.structuredTranscriptTexts = structuredTranscriptTexts
+        self.structuredStreamScripts = structuredStreamScripts
     }
 
     func respondText(to prompt: String, maximumResponseTokens: Int?) async throws -> SessionTextResult {
@@ -835,6 +1192,114 @@ private actor ScriptedSessionHandle: SessionHandle {
             throw SessionFailure.generationFailed("Type mismatch for structured response")
         }
         return SessionStructuredResult(content: typedValue, transcriptText: transcript)
+    }
+
+    func streamStructured<Content: Generable>(
+        to prompt: String,
+        generating type: Content.Type,
+        includeSchemaInPrompt: Bool,
+        maximumResponseTokens: Int?
+    ) async -> AsyncThrowingStream<SessionStructuredStreamEvent<Content>, Error> {
+        let script = if structuredStreamScripts.isEmpty {
+            ScriptedStructuredStream(
+                finalContent: "default",
+                finalTranscriptText: "\"default\""
+            )
+        } else {
+            structuredStreamScripts.removeFirst()
+        }
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for (index, partial) in script.partials.enumerated() {
+                        if script.stepDelayNanoseconds > 0 {
+                            try await Task.sleep(nanoseconds: script.stepDelayNanoseconds)
+                        }
+
+                        let partialTranscriptText =
+                            script.partialTranscriptTexts.indices.contains(index)
+                            ? script.partialTranscriptTexts[index]
+                            : String(describing: partial)
+                        let partialRawContent =
+                            script.partialRawContents.indices.contains(index)
+                            ? script.partialRawContents[index]
+                            : GeneratedContent(partialTranscriptText)
+                        let partialContent: Content.PartiallyGenerated
+                        if let typedPartial = partial as? Content.PartiallyGenerated {
+                            partialContent = typedPartial
+                        } else {
+                            partialContent = try Content(partialRawContent).asPartiallyGenerated()
+                        }
+
+                        continuation.yield(
+                            .partial(
+                                SessionStructuredStreamPartial(
+                                    content: partialContent,
+                                    transcriptText: partialTranscriptText,
+                                    rawContent: partialRawContent
+                                )
+                            )
+                        )
+                    }
+
+                    if script.stepDelayNanoseconds > 0 {
+                        try await Task.sleep(nanoseconds: script.stepDelayNanoseconds)
+                    }
+
+                    if let failure = script.failure {
+                        continuation.finish(throwing: failure)
+                        return
+                    }
+
+                    guard let finalContent = script.finalContent as? Content else {
+                        throw SessionFailure.generationFailed("Type mismatch for streaming final content")
+                    }
+
+                    continuation.yield(
+                        .completed(
+                            SessionStructuredResult(
+                                content: finalContent,
+                                transcriptText: script.finalTranscriptText
+                            )
+                        )
+                    )
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch let error as SessionFailure {
+                    continuation.finish(throwing: error)
+                } catch {
+                    continuation.finish(throwing: SessionFailure.generationFailed(error.localizedDescription))
+                }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
+        }
+    }
+}
+
+private struct ScriptedStructuredStream: @unchecked Sendable {
+    var partials: [Any] = []
+    var partialTranscriptTexts: [String] = []
+    var partialRawContents: [GeneratedContent] = []
+    var finalContent: Any
+    var finalTranscriptText: String
+    var failure: SessionFailure? = nil
+    var stepDelayNanoseconds: UInt64 = 0
+}
+
+private actor StreamProbe {
+    private var value: String?
+
+    func record(_ value: String) {
+        self.value = value
+    }
+
+    func lastValue() -> String? {
+        value
     }
 }
 

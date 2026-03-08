@@ -29,6 +29,17 @@ public actor LanguageModelContextKit {
         self.logger = DiagnosticsLogger(policy: configuration.diagnostics)
     }
 
+    public func availabilityStatus(for policy: ModelPolicy = .default) async -> AvailabilityStatus {
+        sessionDriver.availability(for: policy).publicStatus
+    }
+
+    public func supportsLocale(
+        _ locale: Locale?,
+        policy: ModelPolicy = .default
+    ) async -> Bool {
+        sessionDriver.supportsLocale(locale, policy: policy)
+    }
+
     public func openThread(
         id: String,
         configuration threadConfiguration: ThreadConfiguration
@@ -50,6 +61,91 @@ public actor LanguageModelContextKit {
         threads[id] = LogicalThread(state: updatedState, configuration: threadConfiguration)
         liveSessions.removeValue(forKey: id)
         try await self.configuration.persistence.threads.save(updatedState, threadID: id)
+    }
+
+    public func importThread(
+        id: String,
+        configuration threadConfiguration: ThreadConfiguration,
+        turns: [NormalizedTurn],
+        durableMemory: [DurableMemoryRecord],
+        replaceExisting: Bool = false
+    ) async throws {
+        let existingState = try await loadedThreadState(threadID: id)
+        let existingMemories = replaceExisting ? [] : try await configuration.persistence.memories.load(threadID: id)
+        let combinedTurns = replaceExisting ? turns : (existingState?.turns ?? []) + turns
+        let sortedTurns = combinedTurns.sorted(by: Self.sortTurnsByCreatedAt)
+        let createdAt = existingState?.createdAt ?? Date()
+        let activeWindowIndex = max(
+            existingState?.activeWindowIndex ?? 0,
+            sortedTurns.map(\.windowIndex).max() ?? 0
+        )
+        let state = PersistedThreadState(
+            threadID: id,
+            instructions: threadConfiguration.instructions,
+            localeIdentifier: threadConfiguration.locale?.identifier,
+            model: threadConfiguration.model,
+            activeWindowIndex: activeWindowIndex,
+            turns: sortedTurns,
+            lastBudget: nil,
+            lastCompaction: nil,
+            lastBridge: nil,
+            createdAt: createdAt,
+            updatedAt: Date()
+        )
+        let logicalThread = LogicalThread(state: state, configuration: threadConfiguration)
+        let mergedMemories = replaceExisting ? durableMemory : existingMemories + durableMemory
+
+        threads[id] = logicalThread
+        liveSessions.removeValue(forKey: id)
+        try await persist(thread: logicalThread, durableMemory: mergedMemories)
+    }
+
+    public func appendTurns(
+        _ turns: [NormalizedTurn],
+        threadID: String
+    ) async throws {
+        var state = try await requireThreadState(threadID: threadID)
+        state.turns.append(contentsOf: turns)
+        state.turns.sort(by: Self.sortTurnsByCreatedAt)
+        state.activeWindowIndex = max(
+            state.activeWindowIndex,
+            turns.map(\.windowIndex).max() ?? state.activeWindowIndex
+        )
+        state.updatedAt = Date()
+
+        try await saveThreadState(state, threadID: threadID)
+        liveSessions.removeValue(forKey: threadID)
+    }
+
+    public func appendMemories(
+        _ records: [DurableMemoryRecord],
+        threadID: String,
+        deduplicate: Bool = true
+    ) async throws {
+        var state = try await requireThreadState(threadID: threadID)
+        let existingMemories = try await configuration.persistence.memories.load(threadID: threadID)
+        let combinedMemories = deduplicate
+            ? deduplicatedMemories(existingMemories + records)
+            : existingMemories + records
+
+        state.updatedAt = Date()
+
+        try await saveThreadState(state, threadID: threadID)
+        try await saveMemories(combinedMemories, threadID: threadID)
+        liveSessions.removeValue(forKey: threadID)
+    }
+
+    public func threadState(
+        threadID: String
+    ) async throws -> PersistedThreadState {
+        try await requireThreadState(threadID: threadID)
+    }
+
+    public func durableMemories(
+        threadID: String
+    ) async throws -> [DurableMemoryRecord] {
+        _ = try await requireThreadState(threadID: threadID)
+        return try await configuration.persistence.memories.load(threadID: threadID)
     }
 
     public func estimateBudget(
@@ -95,19 +191,10 @@ public actor LanguageModelContextKit {
                     maximumResponseTokens: configuration.budget.reservedOutputTokens
                 )
 
-                capture(
+                return try await finalizeTextResponse(
                     prompt: prompt,
-                    responseText: result.text,
-                    thread: &prepared.thread,
-                    budget: prepared.plan.budget,
-                    compaction: makeCompactionReport(from: prepared.plan),
-                    bridge: bridge
-                )
-                try await persist(thread: prepared.thread, durableMemory: prepared.plan.durableMemory)
-                return ManagedTextResponse(
                     text: result.text,
-                    budget: prepared.plan.budget,
-                    compaction: makeCompactionReport(from: prepared.plan),
+                    prepared: &prepared,
                     bridge: bridge
                 )
             } catch let failure as SessionFailure {
@@ -143,6 +230,8 @@ public actor LanguageModelContextKit {
                 case .generationFailed(let message):
                     throw LanguageModelContextKitError.generationFailed(message)
                 }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch let error as LanguageModelContextKitError {
                 throw error
             } catch {
@@ -151,15 +240,16 @@ public actor LanguageModelContextKit {
         }
     }
 
-    public func respond<T: Generable>(
+    public func respondManaged<Content: Generable>(
         to prompt: String,
-        generating type: T.Type,
+        generating type: Content.Type,
         threadID: String,
-        includeSchemaInPrompt: Bool? = nil
-    ) async throws -> T {
+        includeSchemaInPrompt: Bool? = nil,
+        transcriptRenderer: (@Sendable (Content) -> String)? = nil
+    ) async throws -> ManagedStructuredResponse<Content> {
         let logicalThread = try await requireThread(threadID)
         try await validateAvailability(for: logicalThread)
-        let schemaDescription = String(describing: T.self)
+        let schemaDescription = String(describing: Content.self)
         var prepared = try await preparePlan(
             for: logicalThread,
             prompt: prompt,
@@ -186,16 +276,13 @@ public actor LanguageModelContextKit {
                     maximumResponseTokens: configuration.budget.reservedOutputTokens
                 )
 
-                capture(
+                return try await finalizeStructuredResponse(
                     prompt: prompt,
-                    responseText: result.transcriptText,
-                    thread: &prepared.thread,
-                    budget: prepared.plan.budget,
-                    compaction: makeCompactionReport(from: prepared.plan),
-                    bridge: bridge
+                    result: result,
+                    prepared: &prepared,
+                    bridge: bridge,
+                    transcriptRenderer: transcriptRenderer
                 )
-                try await persist(thread: prepared.thread, durableMemory: prepared.plan.durableMemory)
-                return result.content
             } catch let failure as SessionFailure {
                 switch failure {
                 case .exceededContextWindowSize:
@@ -229,10 +316,86 @@ public actor LanguageModelContextKit {
                 case .generationFailed(let message):
                     throw LanguageModelContextKitError.generationFailed(message)
                 }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch let error as LanguageModelContextKitError {
                 throw error
             } catch {
                 throw LanguageModelContextKitError.generationFailed(error.localizedDescription)
+            }
+        }
+    }
+
+    public func respond<T: Generable>(
+        to prompt: String,
+        generating type: T.Type,
+        threadID: String,
+        includeSchemaInPrompt: Bool? = nil,
+        transcriptRenderer: (@Sendable (T) -> String)? = nil
+    ) async throws -> T {
+        try await respondManaged(
+            to: prompt,
+            generating: type,
+            threadID: threadID,
+            includeSchemaInPrompt: includeSchemaInPrompt,
+            transcriptRenderer: transcriptRenderer
+        ).content
+    }
+
+    public func streamText(
+        to prompt: String,
+        threadID: String
+    ) -> AsyncThrowingStream<ManagedTextStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await streamText(
+                        to: prompt,
+                        threadID: threadID,
+                        continuation: continuation
+                    )
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
+        }
+    }
+
+    public func streamManaged<Content: Generable>(
+        to prompt: String,
+        generating type: Content.Type,
+        threadID: String,
+        includeSchemaInPrompt: Bool? = nil,
+        transcriptRenderer: (@Sendable (Content) -> String)? = nil
+    ) -> AsyncThrowingStream<ManagedStructuredStreamEvent<Content>, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try await streamManaged(
+                        to: prompt,
+                        generating: type,
+                        threadID: threadID,
+                        includeSchemaInPrompt: includeSchemaInPrompt,
+                        transcriptRenderer: transcriptRenderer,
+                        continuation: continuation
+                    )
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
             }
         }
     }
@@ -313,6 +476,291 @@ public actor LanguageModelContextKit {
         liveSessions.removeValue(forKey: threadID)
         try await configuration.persistence.threads.delete(threadID: threadID)
         try await configuration.persistence.memories.deleteAll(threadID: threadID)
+    }
+
+    private func loadedThreadState(
+        threadID: String
+    ) async throws -> PersistedThreadState? {
+        if let thread = threads[threadID] {
+            return thread.state
+        }
+        return try await configuration.persistence.threads.load(threadID: threadID)
+    }
+
+    private func requireThreadState(
+        threadID: String
+    ) async throws -> PersistedThreadState {
+        guard let state = try await loadedThreadState(threadID: threadID) else {
+            throw LanguageModelContextKitError.threadNotFound(threadID)
+        }
+        return state
+    }
+
+    private func finalizeTextResponse(
+        prompt: String,
+        text: String,
+        prepared: inout PreparedRequest,
+        bridge: BridgeReport?
+    ) async throws -> ManagedTextResponse {
+        try Task.checkCancellation()
+        let compaction = makeCompactionReport(from: prepared.plan)
+        let response = ManagedTextResponse(
+            text: text,
+            budget: prepared.plan.budget,
+            compaction: compaction,
+            bridge: bridge
+        )
+
+        capture(
+            prompt: prompt,
+            responseText: text,
+            thread: &prepared.thread,
+            budget: prepared.plan.budget,
+            compaction: compaction,
+            bridge: bridge
+        )
+        try await persist(thread: prepared.thread, durableMemory: prepared.plan.durableMemory)
+        return response
+    }
+
+    private func finalizeStructuredResponse<Content: Generable>(
+        prompt: String,
+        result: SessionStructuredResult<Content>,
+        prepared: inout PreparedRequest,
+        bridge: BridgeReport?,
+        transcriptRenderer: (@Sendable (Content) -> String)?
+    ) async throws -> ManagedStructuredResponse<Content> {
+        try Task.checkCancellation()
+        let compaction = makeCompactionReport(from: prepared.plan)
+        let response = ManagedStructuredResponse(
+            content: result.content,
+            transcriptText: result.transcriptText,
+            budget: prepared.plan.budget,
+            compaction: compaction,
+            bridge: bridge
+        )
+
+        capture(
+            prompt: prompt,
+            responseText: persistedAssistantText(
+                content: result.content,
+                transcriptText: result.transcriptText,
+                transcriptRenderer: transcriptRenderer
+            ),
+            thread: &prepared.thread,
+            budget: prepared.plan.budget,
+            compaction: compaction,
+            bridge: bridge
+        )
+        try await persist(thread: prepared.thread, durableMemory: prepared.plan.durableMemory)
+        return response
+    }
+
+    private func streamText(
+        to prompt: String,
+        threadID: String,
+        continuation: AsyncThrowingStream<ManagedTextStreamEvent, Error>.Continuation
+    ) async throws {
+        let logicalThread = try await requireThread(threadID)
+        try await validateAvailability(for: logicalThread)
+        var prepared = try await preparePlan(
+            for: logicalThread,
+            prompt: prompt,
+            schemaDescription: String(describing: GeneratedTextEnvelope.self),
+            compactionOptions: .standard(memoryPolicy: configuration.memory)
+        )
+
+        var bridge = prepared.bridge
+        var attempts = 0
+
+        while true {
+            try Task.checkCancellation()
+
+            do {
+                let session = try await session(
+                    for: prepared.thread,
+                    durableMemory: prepared.plan.durableMemory,
+                    recentTail: prepared.plan.recentTail,
+                    forceBridge: prepared.plan.requiresBridge || bridge != nil
+                )
+
+                let stream = await session.streamStructured(
+                    to: prompt,
+                    generating: GeneratedTextEnvelope.self,
+                    includeSchemaInPrompt: true,
+                    maximumResponseTokens: configuration.budget.reservedOutputTokens
+                )
+
+                for try await event in stream {
+                    try Task.checkCancellation()
+
+                    switch event {
+                    case .partial(let partial):
+                        guard let text = generatedText(from: partial.rawContent) else {
+                            continue
+                        }
+                        continuation.yield(.partial(text: text))
+                    case .completed(let result):
+                        let response = try await finalizeStructuredResponse(
+                            prompt: prompt,
+                            result: result,
+                            prepared: &prepared,
+                            bridge: bridge,
+                            transcriptRenderer: { $0.text }
+                        )
+                        continuation.yield(.completed(managedTextResponse(from: response)))
+                        return
+                    }
+                }
+
+                throw LanguageModelContextKitError.generationFailed("Streaming finished without completion")
+            } catch let failure as SessionFailure {
+                switch failure {
+                case .exceededContextWindowSize:
+                    guard attempts < configuration.budget.maxBridgeRetries else {
+                        let diagnostics = makeDiagnostics(
+                            threadID: threadID,
+                            state: prepared.thread.state,
+                            durableMemory: prepared.plan.durableMemory,
+                            budget: prepared.plan.budget,
+                            compaction: makeCompactionReport(from: prepared.plan),
+                            bridge: bridge
+                        )
+                        throw LanguageModelContextKitError.budgetExhausted(diagnostics)
+                    }
+                    attempts += 1
+                    prepared.plan.requiresBridge = true
+                    prepared.thread.state.activeWindowIndex += 1
+                    bridge = BridgeReport(
+                        fromWindowIndex: max(0, prepared.thread.state.activeWindowIndex - 1),
+                        toWindowIndex: prepared.thread.state.activeWindowIndex,
+                        reason: "exceededContextWindowSize",
+                        carriedTurnCount: prepared.plan.recentTail.count,
+                        summaryUsed: prepared.plan.summaryCreated
+                    )
+                    liveSessions.removeValue(forKey: threadID)
+                    continue
+                case .unsupportedLocale(let message):
+                    throw LanguageModelContextKitError.unsupportedLocale(message)
+                case .refusal(let message):
+                    throw LanguageModelContextKitError.refusal(message)
+                case .generationFailed(let message):
+                    throw LanguageModelContextKitError.generationFailed(message)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as LanguageModelContextKitError {
+                throw error
+            } catch {
+                throw LanguageModelContextKitError.generationFailed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func streamManaged<Content: Generable>(
+        to prompt: String,
+        generating type: Content.Type,
+        threadID: String,
+        includeSchemaInPrompt: Bool?,
+        transcriptRenderer: (@Sendable (Content) -> String)?,
+        continuation: AsyncThrowingStream<ManagedStructuredStreamEvent<Content>, Error>.Continuation
+    ) async throws {
+        let logicalThread = try await requireThread(threadID)
+        try await validateAvailability(for: logicalThread)
+        var prepared = try await preparePlan(
+            for: logicalThread,
+            prompt: prompt,
+            schemaDescription: String(describing: Content.self),
+            compactionOptions: .standard(memoryPolicy: configuration.memory)
+        )
+
+        var bridge = prepared.bridge
+        var attempts = 0
+
+        while true {
+            try Task.checkCancellation()
+
+            do {
+                let session = try await session(
+                    for: prepared.thread,
+                    durableMemory: prepared.plan.durableMemory,
+                    recentTail: prepared.plan.recentTail,
+                    forceBridge: prepared.plan.requiresBridge || bridge != nil
+                )
+
+                let stream = await session.streamStructured(
+                    to: prompt,
+                    generating: type,
+                    includeSchemaInPrompt: includeSchemaInPrompt ?? true,
+                    maximumResponseTokens: configuration.budget.reservedOutputTokens
+                )
+
+                for try await event in stream {
+                    try Task.checkCancellation()
+
+                    switch event {
+                    case .partial(let partial):
+                        continuation.yield(
+                            .partial(
+                                content: partial.content,
+                                transcriptText: partial.transcriptText
+                            )
+                        )
+                    case .completed(let result):
+                        let response = try await finalizeStructuredResponse(
+                            prompt: prompt,
+                            result: result,
+                            prepared: &prepared,
+                            bridge: bridge,
+                            transcriptRenderer: transcriptRenderer
+                        )
+                        continuation.yield(.completed(response))
+                        return
+                    }
+                }
+
+                throw LanguageModelContextKitError.generationFailed("Streaming finished without completion")
+            } catch let failure as SessionFailure {
+                switch failure {
+                case .exceededContextWindowSize:
+                    guard attempts < configuration.budget.maxBridgeRetries else {
+                        let diagnostics = makeDiagnostics(
+                            threadID: threadID,
+                            state: prepared.thread.state,
+                            durableMemory: prepared.plan.durableMemory,
+                            budget: prepared.plan.budget,
+                            compaction: makeCompactionReport(from: prepared.plan),
+                            bridge: bridge
+                        )
+                        throw LanguageModelContextKitError.budgetExhausted(diagnostics)
+                    }
+                    attempts += 1
+                    prepared.plan.requiresBridge = true
+                    prepared.thread.state.activeWindowIndex += 1
+                    bridge = BridgeReport(
+                        fromWindowIndex: max(0, prepared.thread.state.activeWindowIndex - 1),
+                        toWindowIndex: prepared.thread.state.activeWindowIndex,
+                        reason: "exceededContextWindowSize",
+                        carriedTurnCount: prepared.plan.recentTail.count,
+                        summaryUsed: prepared.plan.summaryCreated
+                    )
+                    liveSessions.removeValue(forKey: threadID)
+                    continue
+                case .unsupportedLocale(let message):
+                    throw LanguageModelContextKitError.unsupportedLocale(message)
+                case .refusal(let message):
+                    throw LanguageModelContextKitError.refusal(message)
+                case .generationFailed(let message):
+                    throw LanguageModelContextKitError.generationFailed(message)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as LanguageModelContextKitError {
+                throw error
+            } catch {
+                throw LanguageModelContextKitError.generationFailed(error.localizedDescription)
+            }
+        }
     }
 
     private func calculateBudget(
@@ -534,13 +982,76 @@ public actor LanguageModelContextKit {
         thread: LogicalThread,
         durableMemory: [DurableMemoryRecord]
     ) async throws {
+        try await saveThreadState(thread.state, threadID: thread.state.threadID)
+        try await saveMemories(durableMemory, threadID: thread.state.threadID)
+    }
+
+    private func saveThreadState(
+        _ state: PersistedThreadState,
+        threadID: String
+    ) async throws {
         do {
-            try await configuration.persistence.threads.save(thread.state, threadID: thread.state.threadID)
-            try await configuration.persistence.memories.save(durableMemory, threadID: thread.state.threadID)
+            try await configuration.persistence.threads.save(state, threadID: threadID)
+            if var thread = threads[threadID] {
+                thread.state = state
+                threads[threadID] = thread
+            }
         } catch {
-            logger.error("persist failed for thread \(thread.state.threadID): \(error.localizedDescription)")
+            logger.error("persist failed for thread \(threadID): \(error.localizedDescription)")
             throw LanguageModelContextKitError.persistenceFailed(error.localizedDescription)
         }
+    }
+
+    private func saveMemories(
+        _ durableMemory: [DurableMemoryRecord],
+        threadID: String
+    ) async throws {
+        do {
+            try await configuration.persistence.memories.save(durableMemory, threadID: threadID)
+        } catch {
+            logger.error("persist failed for thread \(threadID): \(error.localizedDescription)")
+            throw LanguageModelContextKitError.persistenceFailed(error.localizedDescription)
+        }
+    }
+
+    private func deduplicatedMemories(
+        _ records: [DurableMemoryRecord]
+    ) -> [DurableMemoryRecord] {
+        var seen: Set<String> = []
+        var unique: [DurableMemoryRecord] = []
+
+        for record in records {
+            let key = "\(record.kind.rawValue)\u{1F}\(record.text)"
+            guard seen.insert(key).inserted else {
+                continue
+            }
+            unique.append(record)
+        }
+
+        return unique
+    }
+
+    private func persistedAssistantText<Content: Generable>(
+        content: Content,
+        transcriptText: String,
+        transcriptRenderer: (@Sendable (Content) -> String)?
+    ) -> String {
+        transcriptRenderer?(content) ?? transcriptText
+    }
+
+    private func managedTextResponse(
+        from response: ManagedStructuredResponse<GeneratedTextEnvelope>
+    ) -> ManagedTextResponse {
+        ManagedTextResponse(
+            text: response.content.text,
+            budget: response.budget,
+            compaction: response.compaction,
+            bridge: response.bridge
+        )
+    }
+
+    private func generatedText(from rawContent: GeneratedContent) -> String? {
+        rawContent.stringValue(forProperty: "text")
     }
 
     private func makeCompactionReport(from plan: ContextPlan) -> CompactionReport? {
@@ -573,5 +1084,31 @@ public actor LanguageModelContextKit {
 
     private func resolvedContextWindowTokens(for policy: ModelPolicy) -> Int {
         sessionDriver.contextWindowTokens(for: policy) ?? configuration.budget.defaultContextWindowTokens
+    }
+
+    private static func sortTurnsByCreatedAt(
+        lhs: NormalizedTurn,
+        rhs: NormalizedTurn
+    ) -> Bool {
+        if lhs.createdAt != rhs.createdAt {
+            return lhs.createdAt < rhs.createdAt
+        }
+        return lhs.id.uuidString < rhs.id.uuidString
+    }
+}
+
+private extension GeneratedContent {
+    var stringValue: String? {
+        guard case .string(let value) = kind else {
+            return nil
+        }
+        return value
+    }
+
+    func stringValue(forProperty property: String) -> String? {
+        guard case .structure(let properties, _) = kind else {
+            return nil
+        }
+        return properties[property]?.stringValue
     }
 }
