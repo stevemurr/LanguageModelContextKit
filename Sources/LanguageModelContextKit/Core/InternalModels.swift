@@ -62,6 +62,11 @@ struct PreparedRequest: Sendable {
     var bridge: BridgeReport?
 }
 
+struct ModelCompactionSummary: Sendable, Equatable {
+    var compactedState: CompactedState
+    var summaryText: String?
+}
+
 struct SessionSeed: Sendable {
     var instructions: String?
 }
@@ -113,6 +118,12 @@ protocol SessionDriving: Sendable {
         locale: Locale?,
         maximumResponseTokens: Int?
     ) async -> String?
+    func summarizeStructured(
+        turns: [NormalizedTurn],
+        policy: ModelPolicy,
+        locale: Locale?,
+        maximumResponseTokens: Int?
+    ) async -> ModelCompactionSummary?
 }
 
 extension PersistedThreadState {

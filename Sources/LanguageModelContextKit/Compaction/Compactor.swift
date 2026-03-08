@@ -348,13 +348,26 @@ enum SummaryReducerSupport {
         chunkSummaryTargetTokens: Int
     ) async throws -> Result {
         let chunks = chunk(turns: turns, targetSize: chunkTargetTokens)
-        let chunkStates = chunks.map(extractCompactedState)
-        let mergedState = merge(chunkStates)
-        let chunkSummaryTurns = chunks.enumerated().map { index, chunk in
-            let chunkState = extractCompactedState(from: chunk)
+        var chunkResults: [Result] = []
+        chunkResults.reserveCapacity(chunks.count)
+
+        for chunk in chunks {
+            chunkResults.append(
+                await summarizeChunk(
+                    chunk,
+                    policy: policy,
+                    locale: locale,
+                    sessionDriver: sessionDriver,
+                    maximumResponseTokens: chunkSummaryTargetTokens
+                )
+            )
+        }
+
+        let mergedState = merge(chunkResults.map(\.compactedState))
+        let chunkSummaryTurns = chunkResults.enumerated().map { index, result in
             return NormalizedTurn(
                 role: .summary,
-                text: "Chunk \(index + 1): " + renderSummary(chunkState, summaryText: nil),
+                text: "Chunk \(index + 1): " + renderSummary(result.compactedState, summaryText: result.summaryText),
                 priority: 500,
                 tags: ["chunk-summary"],
                 windowIndex: state.activeWindowIndex,
@@ -362,6 +375,7 @@ enum SummaryReducerSupport {
             )
         }
         let turnsForSummary = chunkSummaryTurns.count > 1 ? chunkSummaryTurns : turns
+        let preferredSummary = chunkResults.count == 1 ? chunkResults.first?.summaryText : nil
         let modelSummary = await recursiveSummary(
             turns: turnsForSummary,
             policy: policy,
@@ -369,9 +383,41 @@ enum SummaryReducerSupport {
             sessionDriver: sessionDriver,
             maximumDepth: maximumDepth,
             chunkTargetTokens: chunkTargetTokens,
-            chunkSummaryTargetTokens: chunkSummaryTargetTokens
+            chunkSummaryTargetTokens: chunkSummaryTargetTokens,
+            preferredSummary: preferredSummary
         )
         return Result(compactedState: mergedState, summaryText: modelSummary)
+    }
+
+    private static func summarizeChunk(
+        _ turns: [NormalizedTurn],
+        policy: ModelPolicy,
+        locale: Locale?,
+        sessionDriver: any SessionDriving,
+        maximumResponseTokens: Int
+    ) async -> Result {
+        if let structured = await sessionDriver.summarizeStructured(
+            turns: turns,
+            policy: policy,
+            locale: locale,
+            maximumResponseTokens: maximumResponseTokens
+        ) {
+            return Result(
+                compactedState: mergeBlobReferences(from: turns, into: structured.compactedState),
+                summaryText: structured.summaryText
+            )
+        }
+
+        let compactedState = extractCompactedState(from: turns)
+        let summaryText =
+            await sessionDriver.summarize(
+                turns: turns,
+                policy: policy,
+                locale: locale,
+                maximumResponseTokens: maximumResponseTokens
+            )
+            ?? renderSummary(compactedState, summaryText: nil)
+        return Result(compactedState: compactedState, summaryText: summaryText)
     }
 
     private static func recursiveSummary(
@@ -381,7 +427,8 @@ enum SummaryReducerSupport {
         sessionDriver: any SessionDriving,
         maximumDepth: Int,
         chunkTargetTokens: Int,
-        chunkSummaryTargetTokens: Int
+        chunkSummaryTargetTokens: Int,
+        preferredSummary: String? = nil
     ) async -> String? {
         guard !turns.isEmpty else {
             return nil
@@ -389,6 +436,9 @@ enum SummaryReducerSupport {
 
         let chunks = chunk(turns: turns, targetSize: chunkTargetTokens)
         if maximumDepth <= 1 || chunks.count <= 1 {
+            if let preferredSummary {
+                return preferredSummary
+            }
             return await sessionDriver.summarize(
                 turns: turns,
                 policy: policy,
@@ -656,7 +706,7 @@ enum SummaryReducerSupport {
     }
 
     private static func merge(_ states: [CompactedState]) -> CompactedState {
-        states.reduce(into: CompactedState()) { partialResult, state in
+        let merged = states.reduce(into: CompactedState()) { partialResult, state in
             partialResult.stableFacts.append(contentsOf: state.stableFacts)
             partialResult.userConstraints.append(contentsOf: state.userConstraints)
             partialResult.openTasks.append(contentsOf: state.openTasks)
@@ -665,6 +715,28 @@ enum SummaryReducerSupport {
             partialResult.blobReferences.append(contentsOf: state.blobReferences)
             partialResult.retrievalHints.append(contentsOf: state.retrievalHints)
         }
+        return CompactedState(
+            stableFacts: deduplicate(merged.stableFacts) { "\($0.key)=\($0.value)" },
+            userConstraints: deduplicate(merged.userConstraints),
+            openTasks: deduplicate(merged.openTasks) { "\($0.description)|\($0.status)" },
+            decisions: deduplicate(merged.decisions) { $0.summary },
+            entities: deduplicate(merged.entities) { "\($0.name)|\($0.type)" },
+            blobReferences: deduplicate(merged.blobReferences) { "\($0.id.uuidString)|\($0.reason)" },
+            retrievalHints: deduplicate(merged.retrievalHints)
+        )
+    }
+
+    private static func mergeBlobReferences(
+        from turns: [NormalizedTurn],
+        into state: CompactedState
+    ) -> CompactedState {
+        var merged = state
+        merged.blobReferences = deduplicate(
+            state.blobReferences + turns.flatMap { turn in
+                turn.blobIDs.map { BlobReference(id: $0, reason: "Referenced from \(turn.role.rawValue) turn") }
+            }
+        ) { "\($0.id.uuidString)|\($0.reason)" }
+        return merged
     }
 
     private static func deduplicate<T>(

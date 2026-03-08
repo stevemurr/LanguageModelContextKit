@@ -367,6 +367,76 @@ struct LanguageModelContextKitTests {
         #expect(memories.isEmpty)
     }
 
+    @Test("Structured compaction prefers model generated state")
+    func structuredCompactionUsesModelState() async throws {
+        let driver = FakeSessionDriver(
+            summaryText: "summarized thread",
+            structuredSummaryValue: ModelCompactionSummary(
+                compactedState: CompactedState(
+                    stableFacts: [StableFact(key: "Repository", value: "LanguageModelContextKit")],
+                    userConstraints: ["Keep the README concise."],
+                    openTasks: [OpenTask(description: "Polish API docs", status: "open")],
+                    decisions: [Decision(summary: "Use actors for thread orchestration.")],
+                    entities: [EntityRef(name: "LanguageModelContextKit", type: "module")],
+                    blobReferences: [],
+                    retrievalHints: ["README", "actors"]
+                ),
+                summaryText: "Repository and documentation decisions were preserved."
+            )
+        )
+        let threadStore = InMemoryThreadStore()
+        let memoryStore = InMemoryMemoryStore()
+        let blobStore = InspectableBlobStore()
+        let persisted = PersistedThreadState(
+            threadID: "thread-model-summary",
+            instructions: "Preserve durable project state.",
+            localeIdentifier: "en_US",
+            model: .default,
+            turns: [
+                NormalizedTurn(
+                    role: .user,
+                    text: "The repository name is LanguageModelContextKit.",
+                    priority: 950,
+                    tags: ["prompt"],
+                    windowIndex: 0
+                ),
+                NormalizedTurn(
+                    role: .assistant,
+                    text: "We selected Swift actors for coordination.",
+                    priority: 800,
+                    tags: ["response"],
+                    windowIndex: 0
+                )
+            ]
+        )
+        try await threadStore.save(persisted, threadID: persisted.threadID)
+
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                compaction: CompactionPolicy(mode: .structuredSummary, maxRecentTurns: 0),
+                persistence: PersistencePolicy(
+                    threads: threadStore,
+                    memories: memoryStore,
+                    blobs: blobStore
+                ),
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            ),
+            sessionDriver: driver
+        )
+
+        try await kit.openThread(
+            id: "thread-model-summary",
+            configuration: ThreadConfiguration(instructions: "Preserve durable project state.")
+        )
+
+        let report = try await kit.compact(threadID: "thread-model-summary")
+        let memories = try await memoryStore.load(threadID: "thread-model-summary")
+
+        #expect(report.summaryCreated)
+        #expect(memories.contains { $0.kind == .fact && $0.text == "Repository: LanguageModelContextKit" })
+        #expect(memories.contains { $0.kind == .decision && $0.text == "Use actors for thread orchestration." })
+    }
+
     @Test("Unavailable model maps to typed error")
     func unavailableModelError() async throws {
         let driver = FakeSessionDriver(availabilityValue: .unavailable("model unavailable"))
@@ -601,6 +671,7 @@ private struct FakeSessionDriver: SessionDriving {
     let availabilityValue: ModelAvailability
     let localeSupported: Bool
     let summaryText: String?
+    let structuredSummaryValue: ModelCompactionSummary?
     let contextWindowTokensValue: Int?
     let exactBudgetEstimatorValue: (any ExactBudgetEstimating)?
     let state: FakeDriverState
@@ -609,6 +680,7 @@ private struct FakeSessionDriver: SessionDriving {
         availabilityValue: ModelAvailability = .available,
         localeSupported: Bool = true,
         summaryText: String? = "summary",
+        structuredSummaryValue: ModelCompactionSummary? = nil,
         contextWindowTokensValue: Int? = nil,
         exactBudgetEstimatorValue: (any ExactBudgetEstimating)? = nil,
         state: FakeDriverState = FakeDriverState()
@@ -616,6 +688,7 @@ private struct FakeSessionDriver: SessionDriving {
         self.availabilityValue = availabilityValue
         self.localeSupported = localeSupported
         self.summaryText = summaryText
+        self.structuredSummaryValue = structuredSummaryValue
         self.contextWindowTokensValue = contextWindowTokensValue
         self.exactBudgetEstimatorValue = exactBudgetEstimatorValue
         self.state = state
@@ -655,6 +728,15 @@ private struct FakeSessionDriver: SessionDriving {
         maximumResponseTokens: Int?
     ) async -> String? {
         summaryText
+    }
+
+    func summarizeStructured(
+        turns: [NormalizedTurn],
+        policy: ModelPolicy,
+        locale: Locale?,
+        maximumResponseTokens: Int?
+    ) async -> ModelCompactionSummary? {
+        structuredSummaryValue
     }
 }
 
