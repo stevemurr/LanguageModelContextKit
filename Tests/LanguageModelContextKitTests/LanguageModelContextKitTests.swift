@@ -553,6 +553,58 @@ struct LanguageModelContextKitTests {
         #expect(seeds[3].instructions?.contains("Second ok") == true)
     }
 
+    @Test("Budget exhaustion reports in-flight bridge diagnostics")
+    func budgetExhaustionUsesInflightDiagnostics() async throws {
+        let state = FakeDriverState(
+            sessions: [
+                ScriptedSessionHandle(textResponses: [.failure(.exceededContextWindowSize("overflow-1"))]),
+                ScriptedSessionHandle(textResponses: [.failure(.exceededContextWindowSize("overflow-2"))])
+            ]
+        )
+        let driver = FakeSessionDriver(state: state)
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                budget: BudgetPolicy(
+                    reservedOutputTokens: 64,
+                    preemptiveCompactionFraction: 0.78,
+                    emergencyFraction: 0.90,
+                    maxBridgeRetries: 1,
+                    exactCountingPreferred: false,
+                    heuristicSafetyMultiplier: 1.10,
+                    defaultContextWindowTokens: 4096
+                ),
+                persistence: PersistencePolicy(
+                    threads: InMemoryThreadStore(),
+                    memories: InMemoryMemoryStore(),
+                    blobs: InMemoryBlobStore()
+                ),
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            ),
+            sessionDriver: driver
+        )
+
+        try await kit.openThread(
+            id: "thread-budget-exhaustion",
+            configuration: ThreadConfiguration(instructions: "Keep responses brief.")
+        )
+
+        do {
+            _ = try await kit.respond(
+                to: "Oversized request",
+                threadID: "thread-budget-exhaustion"
+            )
+            Issue.record("Expected budget exhaustion")
+        } catch let error as LanguageModelContextKitError {
+            switch error {
+            case .budgetExhausted(let diagnostics):
+                #expect(diagnostics.windowIndex == 1)
+                #expect(diagnostics.lastBridge?.reason == "exceededContextWindowSize")
+            default:
+                Issue.record("Unexpected error: \(error)")
+            }
+        }
+    }
+
     @Test("Keyword retriever ranks overlapping memories")
     func keywordRetriever() async throws {
         let store = InMemoryMemoryStore()

@@ -114,15 +114,13 @@ public actor LanguageModelContextKit {
                 switch failure {
                 case .exceededContextWindowSize:
                     guard attempts < configuration.budget.maxBridgeRetries else {
-                        let diagnostics = await diagnostics(threadID: threadID) ?? ThreadDiagnostics(
+                        let diagnostics = makeDiagnostics(
                             threadID: threadID,
-                            windowIndex: prepared.thread.state.activeWindowIndex,
-                            lastBudget: prepared.plan.budget,
-                            lastCompaction: makeCompactionReport(from: prepared.plan),
-                            lastBridge: bridge,
-                            turnCount: prepared.thread.state.turns.count,
-                            durableMemoryCount: prepared.plan.durableMemory.count,
-                            blobCount: uniqueBlobCount(in: prepared.thread.state.turns, memories: prepared.plan.durableMemory)
+                            state: prepared.thread.state,
+                            durableMemory: prepared.plan.durableMemory,
+                            budget: prepared.plan.budget,
+                            compaction: makeCompactionReport(from: prepared.plan),
+                            bridge: bridge
                         )
                         throw LanguageModelContextKitError.budgetExhausted(diagnostics)
                     }
@@ -202,15 +200,13 @@ public actor LanguageModelContextKit {
                 switch failure {
                 case .exceededContextWindowSize:
                     guard attempts < configuration.budget.maxBridgeRetries else {
-                        let diagnostics = await diagnostics(threadID: threadID) ?? ThreadDiagnostics(
+                        let diagnostics = makeDiagnostics(
                             threadID: threadID,
-                            windowIndex: prepared.thread.state.activeWindowIndex,
-                            lastBudget: prepared.plan.budget,
-                            lastCompaction: makeCompactionReport(from: prepared.plan),
-                            lastBridge: bridge,
-                            turnCount: prepared.thread.state.turns.count,
-                            durableMemoryCount: prepared.plan.durableMemory.count,
-                            blobCount: uniqueBlobCount(in: prepared.thread.state.turns, memories: prepared.plan.durableMemory)
+                            state: prepared.thread.state,
+                            durableMemory: prepared.plan.durableMemory,
+                            budget: prepared.plan.budget,
+                            compaction: makeCompactionReport(from: prepared.plan),
+                            bridge: bridge
                         )
                         throw LanguageModelContextKitError.budgetExhausted(diagnostics)
                     }
@@ -477,6 +473,26 @@ public actor LanguageModelContextKit {
     private func recentTail(from turns: [NormalizedTurn]) -> [NormalizedTurn] {
         let visible = turns.filter { !$0.compacted || $0.role == .summary }
         return Array(visible.suffix(configuration.compaction.maxRecentTurns))
+    }
+
+    private func makeDiagnostics(
+        threadID: String,
+        state: PersistedThreadState,
+        durableMemory: [DurableMemoryRecord],
+        budget: BudgetReport?,
+        compaction: CompactionReport?,
+        bridge: BridgeReport?
+    ) -> ThreadDiagnostics {
+        ThreadDiagnostics(
+            threadID: threadID,
+            windowIndex: state.activeWindowIndex,
+            lastBudget: budget,
+            lastCompaction: compaction,
+            lastBridge: bridge,
+            turnCount: state.turns.count,
+            durableMemoryCount: durableMemory.count,
+            blobCount: uniqueBlobCount(in: state.turns, memories: durableMemory)
+        )
     }
 
     private func capture(
