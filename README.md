@@ -53,6 +53,89 @@ let response = try await kit.respond(
 print(response.text)
 ```
 
+## Availability
+
+Callers can check Foundation Models readiness and locale support without reaching into adapter internals:
+
+```swift
+switch await kit.availabilityStatus() {
+case .available:
+    break
+case .unavailable(let reason):
+    print("Model unavailable:", reason)
+}
+
+let supportsFrench = await kit.supportsLocale(Locale(identifier: "fr_FR"))
+print("French supported:", supportsFrench)
+```
+
+## Structured Responses
+
+Use `respondManaged` when you need structured output plus persisted metadata:
+
+```swift
+import FoundationModels
+
+@Generable(description: "A compact project summary.")
+struct ProjectSummary {
+    var headline: String
+    var openTasks: [String]
+}
+
+let managed = try await kit.respondManaged(
+    to: "Summarize the current project state.",
+    generating: ProjectSummary.self,
+    threadID: "demo-thread",
+    transcriptRenderer: { summary in
+        """
+        \(summary.headline)
+        Open tasks:
+        \(summary.openTasks.joined(separator: "\n"))
+        """
+    }
+)
+
+print(managed.content.headline)
+print(managed.transcriptText)
+print(managed.budget.projectedTotalTokens)
+```
+
+`respond(to:generating:threadID:includeSchemaInPrompt:transcriptRenderer:)` remains available as a convenience wrapper that returns only `managed.content`.
+
+## Streaming
+
+The library exposes managed streaming for both plain text and structured generation. Partial events stream during generation, and one final completion event includes `budget`, `compaction`, and `bridge`. Assistant turns are only persisted on successful completion.
+
+```swift
+for try await event in await kit.streamText(
+    to: "Write a short project status update.",
+    threadID: "demo-thread"
+) {
+    switch event {
+    case .partial(let text):
+        print("partial:", text)
+    case .completed(let response):
+        print("final:", response.text)
+        print("budget:", response.budget.projectedTotalTokens)
+    }
+}
+```
+
+```swift
+for try await event in await kit.streamManaged(
+    to: "Summarize the project state.",
+    generating: ProjectSummary.self,
+    threadID: "demo-thread"
+) {
+    switch event {
+    case .partial(let content, _):
+        print("partial headline:", content.headline)
+    case .completed(let response):
+        print("final tasks:", response.content.openTasks)
+    }
+}
+```
+
 ## Long Thread Example
 
 ```swift
@@ -132,8 +215,44 @@ let kit = LanguageModelContextKit(
 )
 ```
 
+## Importing Existing State
+
+You can bootstrap a logical thread from app-owned history before the next model call:
+
+```swift
+try await kit.importThread(
+    id: "migrated-thread",
+    configuration: ThreadConfiguration(
+        instructions: "Preserve prior user constraints and decisions."
+    ),
+    turns: existingTurns,
+    durableMemory: existingDurableMemory,
+    replaceExisting: true
+)
+```
+
+Imported turns are sorted by `createdAt`, existing `windowIndex` values are preserved, persisted durable memory is written through the configured memory store, and any live in-memory session is invalidated so the next call rehydrates from imported state.
+
+## External Mutations and Inspection
+
+Apps can append externally produced context without going through `respond(...)`:
+
+```swift
+try await kit.appendTurns(toolTurns, threadID: "demo-thread")
+try await kit.appendMemories(memoryRecords, threadID: "demo-thread")
+
+let state = try await kit.threadState(threadID: "demo-thread")
+let memories = try await kit.durableMemories(threadID: "demo-thread")
+
+print(state.turns.count)
+print(memories.count)
+```
+
+Appending turns or memories does not trigger compaction. It updates persisted thread timestamps and invalidates any live session so the next generation request rehydrates cleanly.
+
 ## Notes
 
 - Call `openThread` after app launch or resume for any thread that uses tools, because tool implementations are runtime-only.
 - The library persists normalized turns and durable memories, not Foundation transcript objects.
+- Structured calls persist assistant text from `transcriptRenderer(content)` when provided; otherwise they persist the adapter transcript text.
 - Heuristic token counting is active by default; the exact-counting seam is present for future SDK support.
