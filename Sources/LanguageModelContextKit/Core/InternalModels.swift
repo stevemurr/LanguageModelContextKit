@@ -37,6 +37,25 @@ struct ContextPlan: Sendable {
     var requiresBridge: Bool = false
 }
 
+struct CompactionOptions: Sendable {
+    var force: Bool
+    var allowMemoryExtraction: Bool
+
+    static func standard(memoryPolicy: MemoryPolicy) -> CompactionOptions {
+        CompactionOptions(
+            force: false,
+            allowMemoryExtraction: memoryPolicy.automaticallyExtractMemories
+        )
+    }
+
+    static func manual(memoryPolicy: MemoryPolicy) -> CompactionOptions {
+        CompactionOptions(
+            force: true,
+            allowMemoryExtraction: memoryPolicy.automaticallyExtractMemories
+        )
+    }
+}
+
 struct PreparedRequest: Sendable {
     var thread: LogicalThread
     var plan: ContextPlan
@@ -81,6 +100,8 @@ protocol SessionHandle: Sendable {
 protocol SessionDriving: Sendable {
     func availability(for policy: ModelPolicy) -> ModelAvailability
     func supportsLocale(_ locale: Locale?, policy: ModelPolicy) -> Bool
+    func contextWindowTokens(for policy: ModelPolicy) -> Int?
+    func exactBudgetEstimator(for policy: ModelPolicy) -> (any ExactBudgetEstimating)?
     func makeSession(
         seed: SessionSeed,
         tools: [any Tool],
@@ -89,7 +110,8 @@ protocol SessionDriving: Sendable {
     func summarize(
         turns: [NormalizedTurn],
         policy: ModelPolicy,
-        locale: Locale?
+        locale: Locale?,
+        maximumResponseTokens: Int?
     ) async -> String?
 }
 

@@ -58,12 +58,11 @@ public actor LanguageModelContextKit {
     ) async throws -> BudgetReport {
         let logicalThread = try await requireThread(threadID)
         try await validateAvailability(for: logicalThread)
-        let plan = try await preparePlan(
+        return try await calculateBudget(
             for: logicalThread,
             prompt: prompt,
             schemaDescription: nil
         )
-        return plan.plan.budget
     }
 
     public func respond(
@@ -75,7 +74,8 @@ public actor LanguageModelContextKit {
         var prepared = try await preparePlan(
             for: logicalThread,
             prompt: prompt,
-            schemaDescription: nil
+            schemaDescription: nil,
+            compactionOptions: .standard(memoryPolicy: configuration.memory)
         )
 
         var bridge = prepared.bridge
@@ -165,7 +165,8 @@ public actor LanguageModelContextKit {
         var prepared = try await preparePlan(
             for: logicalThread,
             prompt: prompt,
-            schemaDescription: schemaDescription
+            schemaDescription: schemaDescription,
+            compactionOptions: .standard(memoryPolicy: configuration.memory)
         )
 
         var bridge = prepared.bridge
@@ -247,7 +248,8 @@ public actor LanguageModelContextKit {
         var prepared = try await preparePlan(
             for: logicalThread,
             prompt: "Manual compaction request",
-            schemaDescription: nil
+            schemaDescription: nil,
+            compactionOptions: .manual(memoryPolicy: configuration.memory)
         )
         prepared.plan.requiresBridge = true
         let report = makeCompactionReport(from: prepared.plan)
@@ -306,10 +308,46 @@ public actor LanguageModelContextKit {
         guard threads[threadID] != nil || persisted != nil else {
             throw LanguageModelContextKitError.threadNotFound(threadID)
         }
+        let currentState = threads[threadID]?.state ?? persisted
+        let memories = (try? await configuration.persistence.memories.load(threadID: threadID)) ?? []
+        if let currentState {
+            try await deleteBlobs(ids: Set(currentState.turns.flatMap(\.blobIDs) + memories.flatMap(\.blobIDs)))
+        }
         threads.removeValue(forKey: threadID)
         liveSessions.removeValue(forKey: threadID)
         try await configuration.persistence.threads.delete(threadID: threadID)
         try await configuration.persistence.memories.deleteAll(threadID: threadID)
+    }
+
+    private func calculateBudget(
+        for logicalThread: LogicalThread,
+        prompt: String,
+        schemaDescription: String?
+    ) async throws -> BudgetReport {
+        let durableMemory = try await configuration.persistence.memories.load(threadID: logicalThread.state.threadID)
+        let retrievedMemory = try await configuration.persistence.retriever?.retrieve(
+            query: prompt,
+            threadID: logicalThread.state.threadID,
+            limit: configuration.memory.retrievalLimit
+        ) ?? []
+        let snapshot = ContextSnapshot(
+            instructions: logicalThread.state.instructions,
+            toolDescriptions: logicalThread.configuration.tools.map { ToolDescriptor.describe($0) },
+            durableMemory: durableMemory,
+            retrievedMemory: retrievedMemory,
+            recentTail: recentTail(from: logicalThread.state.turns),
+            currentPrompt: prompt,
+            schemaDescription: schemaDescription
+        )
+        let tokenCounter = tokenCounterFactory.make(
+            preferExact: configuration.budget.exactCountingPreferred,
+            exactEstimator: sessionDriver.exactBudgetEstimator(for: logicalThread.configuration.model)
+        )
+        return tokenCounter.estimate(
+            snapshot: snapshot,
+            budgetPolicy: configuration.budget,
+            contextWindowTokens: resolvedContextWindowTokens(for: logicalThread.configuration.model)
+        )
     }
 
     private func requireThread(_ threadID: String) async throws -> LogicalThread {
@@ -322,7 +360,8 @@ public actor LanguageModelContextKit {
     private func preparePlan(
         for logicalThread: LogicalThread,
         prompt: String,
-        schemaDescription: String?
+        schemaDescription: String?,
+        compactionOptions: CompactionOptions
     ) async throws -> PreparedRequest {
         var thread = logicalThread
         var durableMemory = try await configuration.persistence.memories.load(threadID: thread.state.threadID)
@@ -332,7 +371,12 @@ public actor LanguageModelContextKit {
             limit: configuration.memory.retrievalLimit
         ) ?? []
         let recentTail = recentTail(from: thread.state.turns)
-        let tokenCounter = tokenCounterFactory.make(preferExact: configuration.budget.exactCountingPreferred)
+        let exactBudgetEstimator = sessionDriver.exactBudgetEstimator(for: thread.configuration.model)
+        let contextWindowTokens = resolvedContextWindowTokens(for: thread.configuration.model)
+        let tokenCounter = tokenCounterFactory.make(
+            preferExact: configuration.budget.exactCountingPreferred,
+            exactEstimator: exactBudgetEstimator
+        )
         let snapshot = ContextSnapshot(
             instructions: thread.state.instructions,
             toolDescriptions: thread.configuration.tools.map { ToolDescriptor.describe($0) },
@@ -349,7 +393,11 @@ public actor LanguageModelContextKit {
             recentTail: recentTail,
             currentPrompt: prompt,
             schemaDescription: schemaDescription,
-            budget: tokenCounter.estimate(snapshot: snapshot, budgetPolicy: configuration.budget),
+            budget: tokenCounter.estimate(
+                snapshot: snapshot,
+                budgetPolicy: configuration.budget,
+                contextWindowTokens: contextWindowTokens
+            ),
             originalProjectedTotalTokens: nil
         )
 
@@ -359,7 +407,13 @@ public actor LanguageModelContextKit {
             sessionDriver: sessionDriver,
             logger: logger
         )
-        plan = try await compactor.compact(plan: plan, threadConfiguration: thread.configuration)
+        plan = try await compactor.compact(
+            plan: plan,
+            threadConfiguration: thread.configuration,
+            options: compactionOptions,
+            contextWindowTokens: contextWindowTokens,
+            exactBudgetEstimator: exactBudgetEstimator
+        )
         durableMemory = plan.durableMemory
         thread.state = plan.state
 
@@ -493,5 +547,15 @@ public actor LanguageModelContextKit {
     ) -> Int {
         let ids = Set(turns.flatMap(\.blobIDs) + memories.flatMap(\.blobIDs))
         return ids.count
+    }
+
+    private func deleteBlobs(ids: Set<UUID>) async throws {
+        for id in ids {
+            try await configuration.persistence.blobs.delete(id)
+        }
+    }
+
+    private func resolvedContextWindowTokens(for policy: ModelPolicy) -> Int {
+        sessionDriver.contextWindowTokens(for: policy) ?? configuration.budget.defaultContextWindowTokens
     }
 }

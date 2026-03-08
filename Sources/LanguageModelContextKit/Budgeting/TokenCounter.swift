@@ -3,8 +3,17 @@ import Foundation
 protocol TokenCounter: Sendable {
     func estimate(
         snapshot: ContextSnapshot,
-        budgetPolicy: BudgetPolicy
+        budgetPolicy: BudgetPolicy,
+        contextWindowTokens: Int
     ) -> BudgetReport
+}
+
+protocol ExactBudgetEstimating: Sendable {
+    func estimate(
+        snapshot: ContextSnapshot,
+        budgetPolicy: BudgetPolicy,
+        contextWindowTokens: Int
+    ) -> BudgetReport?
 }
 
 struct HeuristicTokenCounter: TokenCounter {
@@ -16,7 +25,8 @@ struct HeuristicTokenCounter: TokenCounter {
 
     func estimate(
         snapshot: ContextSnapshot,
-        budgetPolicy: BudgetPolicy
+        budgetPolicy: BudgetPolicy,
+        contextWindowTokens: Int
     ) -> BudgetReport {
         var breakdown: [BudgetComponent: Int] = [:]
         breakdown[.instructions] = tokenEstimate(for: snapshot.instructions ?? "", safetyMultiplier: budgetPolicy.heuristicSafetyMultiplier)
@@ -33,7 +43,6 @@ struct HeuristicTokenCounter: TokenCounter {
             .map(\.value)
             .reduce(0, +)
         let projected = inputTokens + budgetPolicy.reservedOutputTokens
-        let contextWindowTokens = budgetPolicy.defaultContextWindowTokens
 
         return BudgetReport(
             accuracy: .approximate,
@@ -85,32 +94,51 @@ struct HeuristicTokenCounter: TokenCounter {
 
 struct AppleExactTokenCounter: TokenCounter {
     private let fallback: HeuristicTokenCounter
+    private let estimator: (any ExactBudgetEstimating)?
 
-    init(fallback: HeuristicTokenCounter = HeuristicTokenCounter()) {
+    init(
+        fallback: HeuristicTokenCounter = HeuristicTokenCounter(),
+        estimator: (any ExactBudgetEstimating)? = nil
+    ) {
         self.fallback = fallback
+        self.estimator = estimator
     }
 
     func estimate(
         snapshot: ContextSnapshot,
-        budgetPolicy: BudgetPolicy
+        budgetPolicy: BudgetPolicy,
+        contextWindowTokens: Int
     ) -> BudgetReport {
-        fallback.estimate(snapshot: snapshot, budgetPolicy: budgetPolicy)
+        if let exact = estimator?.estimate(
+            snapshot: snapshot,
+            budgetPolicy: budgetPolicy,
+            contextWindowTokens: contextWindowTokens
+        ) {
+            return exact
+        }
+        return fallback.estimate(
+            snapshot: snapshot,
+            budgetPolicy: budgetPolicy,
+            contextWindowTokens: contextWindowTokens
+        )
     }
 }
 
 struct TokenCounterFactory: Sendable {
     let heuristicCounter: HeuristicTokenCounter
-    let exactCounter: AppleExactTokenCounter
 
     init(
-        heuristicCounter: HeuristicTokenCounter = HeuristicTokenCounter(),
-        exactCounter: AppleExactTokenCounter = AppleExactTokenCounter()
+        heuristicCounter: HeuristicTokenCounter = HeuristicTokenCounter()
     ) {
         self.heuristicCounter = heuristicCounter
-        self.exactCounter = exactCounter
     }
 
-    func make(preferExact: Bool) -> any TokenCounter {
-        preferExact ? exactCounter : heuristicCounter
+    func make(
+        preferExact: Bool,
+        exactEstimator: (any ExactBudgetEstimating)?
+    ) -> any TokenCounter {
+        preferExact
+            ? AppleExactTokenCounter(fallback: heuristicCounter, estimator: exactEstimator)
+            : heuristicCounter
     }
 }

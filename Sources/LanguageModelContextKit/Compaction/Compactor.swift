@@ -9,14 +9,20 @@ struct ThreadCompactor: Sendable {
 
     func compact(
         plan initialPlan: ContextPlan,
-        threadConfiguration: ThreadConfiguration
+        threadConfiguration: ThreadConfiguration,
+        options: CompactionOptions,
+        contextWindowTokens: Int,
+        exactBudgetEstimator: (any ExactBudgetEstimating)?
     ) async throws -> ContextPlan {
-        let tokenCounter = tokenCounterFactory.make(preferExact: configuration.budget.exactCountingPreferred)
+        let tokenCounter = tokenCounterFactory.make(
+            preferExact: configuration.budget.exactCountingPreferred,
+            exactEstimator: exactBudgetEstimator
+        )
         var plan = initialPlan
         let originalBudget = initialPlan.budget
         plan.originalProjectedTotalTokens = originalBudget.projectedTotalTokens
 
-        guard plan.budget.projectedTotalTokens > plan.budget.softLimitTokens else {
+        guard options.force || plan.budget.projectedTotalTokens > plan.budget.softLimitTokens else {
             return plan
         }
 
@@ -25,7 +31,8 @@ struct ThreadCompactor: Sendable {
                 to: &plan,
                 configuration: configuration,
                 threadConfiguration: threadConfiguration,
-                sessionDriver: sessionDriver
+                sessionDriver: sessionDriver,
+                options: options
             )
             guard changed else {
                 continue
@@ -35,7 +42,8 @@ struct ThreadCompactor: Sendable {
             plan.requiresBridge = true
             plan.budget = tokenCounter.estimate(
                 snapshot: makeSnapshot(from: plan, threadConfiguration: threadConfiguration),
-                budgetPolicy: configuration.budget
+                budgetPolicy: configuration.budget,
+                contextWindowTokens: contextWindowTokens
             )
 
             if plan.budget.projectedTotalTokens <= plan.budget.softLimitTokens {
@@ -102,7 +110,8 @@ protocol ContextReducer: Sendable {
         to plan: inout ContextPlan,
         configuration: ContextManagerConfiguration,
         threadConfiguration: ThreadConfiguration,
-        sessionDriver: any SessionDriving
+        sessionDriver: any SessionDriving,
+        options: CompactionOptions
     ) async throws -> Bool
 }
 
@@ -113,7 +122,8 @@ struct ToolPayloadDigesterReducer: ContextReducer {
         to plan: inout ContextPlan,
         configuration: ContextManagerConfiguration,
         threadConfiguration _: ThreadConfiguration,
-        sessionDriver _: any SessionDriving
+        sessionDriver _: any SessionDriving,
+        options _: CompactionOptions
     ) async throws -> Bool {
         var changed = false
         var updatedTurns: [NormalizedTurn] = []
@@ -176,7 +186,8 @@ struct DropLowPriorityRetrievedMemoryReducer: ContextReducer {
         to plan: inout ContextPlan,
         configuration _: ContextManagerConfiguration,
         threadConfiguration _: ThreadConfiguration,
-        sessionDriver _: any SessionDriving
+        sessionDriver _: any SessionDriving,
+        options _: CompactionOptions
     ) async throws -> Bool {
         guard !plan.retrievedMemory.isEmpty else {
             return false
@@ -193,7 +204,8 @@ struct SlidingTailReducer: ContextReducer {
         to plan: inout ContextPlan,
         configuration _: ContextManagerConfiguration,
         threadConfiguration _: ThreadConfiguration,
-        sessionDriver _: any SessionDriving
+        sessionDriver _: any SessionDriving,
+        options _: CompactionOptions
     ) async throws -> Bool {
         guard plan.recentTail.count > 4 else {
             return false
@@ -211,7 +223,8 @@ struct StructuredSummaryReducer: ContextReducer {
         to plan: inout ContextPlan,
         configuration: ContextManagerConfiguration,
         threadConfiguration: ThreadConfiguration,
-        sessionDriver: any SessionDriving
+        sessionDriver: any SessionDriving,
+        options: CompactionOptions
     ) async throws -> Bool {
         let tailIDs = Set(plan.recentTail.map(\.id))
         let candidates = plan.state.turns.filter { !tailIDs.contains($0.id) && !$0.compacted }
@@ -225,8 +238,9 @@ struct StructuredSummaryReducer: ContextReducer {
             policy: threadConfiguration.model,
             locale: plan.state.locale,
             sessionDriver: sessionDriver,
-            maximumChunks: configuration.compaction.maxMergeDepth,
-            chunkTargetTokens: configuration.compaction.chunkTargetTokens
+            maximumDepth: configuration.compaction.maxMergeDepth,
+            chunkTargetTokens: configuration.compaction.chunkTargetTokens,
+            chunkSummaryTargetTokens: configuration.compaction.chunkSummaryTargetTokens
         )
 
         plan.state.turns = plan.state.turns.map { turn in
@@ -245,10 +259,12 @@ struct StructuredSummaryReducer: ContextReducer {
                 compacted: false
             )
         )
-        plan.durableMemory = SummaryReducerSupport.merge(
-            summary.compactedState,
-            into: plan.durableMemory
-        )
+        if options.allowMemoryExtraction {
+            plan.durableMemory = SummaryReducerSupport.merge(
+                summary.compactedState,
+                into: plan.durableMemory
+            )
+        }
         plan.latestCompactedState = summary.compactedState
         plan.summaryCreated = true
         return true
@@ -262,7 +278,8 @@ struct AggressiveSummaryReducer: ContextReducer {
         to plan: inout ContextPlan,
         configuration: ContextManagerConfiguration,
         threadConfiguration: ThreadConfiguration,
-        sessionDriver: any SessionDriving
+        sessionDriver: any SessionDriving,
+        options: CompactionOptions
     ) async throws -> Bool {
         let keep = Set(plan.state.turns.suffix(2).map(\.id))
         let candidates = plan.state.turns.filter { !keep.contains($0.id) }
@@ -276,13 +293,16 @@ struct AggressiveSummaryReducer: ContextReducer {
             policy: threadConfiguration.model,
             locale: plan.state.locale,
             sessionDriver: sessionDriver,
-            maximumChunks: configuration.compaction.maxMergeDepth,
-            chunkTargetTokens: max(200, configuration.compaction.chunkTargetTokens / 2)
+            maximumDepth: configuration.compaction.maxMergeDepth,
+            chunkTargetTokens: max(200, configuration.compaction.chunkTargetTokens / 2),
+            chunkSummaryTargetTokens: configuration.compaction.chunkSummaryTargetTokens
         )
 
         plan.state.turns = plan.state.turns.map { keep.contains($0.id) ? $0 : $0.markedCompacted() }
         plan.recentTail = Array(plan.state.turns.suffix(2))
-        plan.durableMemory = SummaryReducerSupport.merge(summary.compactedState, into: plan.durableMemory)
+        if options.allowMemoryExtraction {
+            plan.durableMemory = SummaryReducerSupport.merge(summary.compactedState, into: plan.durableMemory)
+        }
         plan.latestCompactedState = summary.compactedState
         plan.summaryCreated = true
         return true
@@ -296,7 +316,8 @@ struct EmergencyResetReducer: ContextReducer {
         to plan: inout ContextPlan,
         configuration _: ContextManagerConfiguration,
         threadConfiguration _: ThreadConfiguration,
-        sessionDriver _: any SessionDriving
+        sessionDriver _: any SessionDriving,
+        options _: CompactionOptions
     ) async throws -> Bool {
         let currentPrompt = plan.currentPrompt
         let reducedMemory = plan.durableMemory.filter { $0.pinned || $0.priority >= 900 }
@@ -322,14 +343,94 @@ enum SummaryReducerSupport {
         policy: ModelPolicy,
         locale: Locale?,
         sessionDriver: any SessionDriving,
-        maximumChunks: Int,
-        chunkTargetTokens: Int
+        maximumDepth: Int,
+        chunkTargetTokens: Int,
+        chunkSummaryTargetTokens: Int
     ) async throws -> Result {
         let chunks = chunk(turns: turns, targetSize: chunkTargetTokens)
         let chunkStates = chunks.map(extractCompactedState)
         let mergedState = merge(chunkStates)
-        let modelSummary = await sessionDriver.summarize(turns: turns, policy: policy, locale: locale)
+        let chunkSummaryTurns = chunks.enumerated().map { index, chunk in
+            let chunkState = extractCompactedState(from: chunk)
+            return NormalizedTurn(
+                role: .summary,
+                text: "Chunk \(index + 1): " + renderSummary(chunkState, summaryText: nil),
+                priority: 500,
+                tags: ["chunk-summary"],
+                windowIndex: state.activeWindowIndex,
+                compacted: false
+            )
+        }
+        let turnsForSummary = chunkSummaryTurns.count > 1 ? chunkSummaryTurns : turns
+        let modelSummary = await recursiveSummary(
+            turns: turnsForSummary,
+            policy: policy,
+            locale: locale,
+            sessionDriver: sessionDriver,
+            maximumDepth: maximumDepth,
+            chunkTargetTokens: chunkTargetTokens,
+            chunkSummaryTargetTokens: chunkSummaryTargetTokens
+        )
         return Result(compactedState: mergedState, summaryText: modelSummary)
+    }
+
+    private static func recursiveSummary(
+        turns: [NormalizedTurn],
+        policy: ModelPolicy,
+        locale: Locale?,
+        sessionDriver: any SessionDriving,
+        maximumDepth: Int,
+        chunkTargetTokens: Int,
+        chunkSummaryTargetTokens: Int
+    ) async -> String? {
+        guard !turns.isEmpty else {
+            return nil
+        }
+
+        let chunks = chunk(turns: turns, targetSize: chunkTargetTokens)
+        if maximumDepth <= 1 || chunks.count <= 1 {
+            return await sessionDriver.summarize(
+                turns: turns,
+                policy: policy,
+                locale: locale,
+                maximumResponseTokens: chunkSummaryTargetTokens
+            )
+        }
+
+        var higherLevelTurns: [NormalizedTurn] = []
+        higherLevelTurns.reserveCapacity(chunks.count)
+
+        for (index, chunk) in chunks.enumerated() {
+            let summaryText =
+                await sessionDriver.summarize(
+                    turns: chunk,
+                    policy: policy,
+                    locale: locale,
+                    maximumResponseTokens: chunkSummaryTargetTokens
+                )
+                ?? renderSummary(extractCompactedState(from: chunk), summaryText: nil)
+
+            higherLevelTurns.append(
+                NormalizedTurn(
+                    role: .summary,
+                    text: "Level summary \(index + 1): \(summaryText)",
+                    priority: 500,
+                    tags: ["hierarchical-summary"],
+                    windowIndex: chunk.last?.windowIndex ?? 0,
+                    compacted: false
+                )
+            )
+        }
+
+        return await recursiveSummary(
+            turns: higherLevelTurns,
+            policy: policy,
+            locale: locale,
+            sessionDriver: sessionDriver,
+            maximumDepth: maximumDepth - 1,
+            chunkTargetTokens: chunkTargetTokens,
+            chunkSummaryTargetTokens: chunkSummaryTargetTokens
+        )
     }
 
     static func renderSummary(_ state: CompactedState, summaryText: String?) -> String {

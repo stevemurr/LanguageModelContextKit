@@ -140,6 +140,266 @@ struct LanguageModelContextKitTests {
         #expect(diagnostics == nil)
     }
 
+    @Test("Estimate budget does not write blobs")
+    func estimateBudgetDoesNotWriteBlobs() async throws {
+        let driver = FakeSessionDriver()
+        let threadStore = InMemoryThreadStore()
+        let memoryStore = InMemoryMemoryStore()
+        let blobStore = InspectableBlobStore()
+        let persisted = PersistedThreadState(
+            threadID: "thread-budget",
+            instructions: "Inspect prior tool output.",
+            localeIdentifier: "en_US",
+            model: .default,
+            turns: [
+                NormalizedTurn(
+                    role: .tool,
+                    text: String(repeating: "tool-output ", count: 400),
+                    priority: 250,
+                    tags: ["tool"],
+                    windowIndex: 0
+                )
+            ]
+        )
+        try await threadStore.save(persisted, threadID: persisted.threadID)
+
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                budget: BudgetPolicy(
+                    reservedOutputTokens: 64,
+                    preemptiveCompactionFraction: 0.10,
+                    emergencyFraction: 0.20,
+                    maxBridgeRetries: 1,
+                    exactCountingPreferred: false,
+                    heuristicSafetyMultiplier: 1.10,
+                    defaultContextWindowTokens: 200
+                ),
+                memory: MemoryPolicy(
+                    automaticallyExtractMemories: true,
+                    retrievalLimit: 5,
+                    inlineBlobByteLimit: 64
+                ),
+                persistence: PersistencePolicy(
+                    threads: threadStore,
+                    memories: memoryStore,
+                    blobs: blobStore
+                ),
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            ),
+            sessionDriver: driver
+        )
+
+        try await kit.openThread(
+            id: "thread-budget",
+            configuration: ThreadConfiguration(instructions: "Inspect prior tool output.")
+        )
+        _ = try await kit.estimateBudget(for: "Summarize", threadID: "thread-budget")
+
+        #expect(await blobStore.count() == 0)
+    }
+
+    @Test("Manual compaction forces reducer pass")
+    func manualCompactionForcesReducers() async throws {
+        let driver = FakeSessionDriver()
+        let threadStore = InMemoryThreadStore()
+        let memoryStore = InMemoryMemoryStore()
+        let blobStore = InspectableBlobStore()
+        let persisted = PersistedThreadState(
+            threadID: "thread-compact",
+            instructions: "Compact on demand.",
+            localeIdentifier: "en_US",
+            model: .default,
+            turns: [
+                NormalizedTurn(
+                    role: .tool,
+                    text: String(repeating: "tool-output ", count: 300),
+                    priority: 250,
+                    tags: ["tool"],
+                    windowIndex: 0
+                )
+            ]
+        )
+        try await threadStore.save(persisted, threadID: persisted.threadID)
+
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                budget: BudgetPolicy(
+                    reservedOutputTokens: 64,
+                    preemptiveCompactionFraction: 0.95,
+                    emergencyFraction: 0.99,
+                    maxBridgeRetries: 1,
+                    exactCountingPreferred: false,
+                    heuristicSafetyMultiplier: 1.10,
+                    defaultContextWindowTokens: 8000
+                ),
+                memory: MemoryPolicy(
+                    automaticallyExtractMemories: true,
+                    retrievalLimit: 5,
+                    inlineBlobByteLimit: 64
+                ),
+                persistence: PersistencePolicy(
+                    threads: threadStore,
+                    memories: memoryStore,
+                    blobs: blobStore
+                ),
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            ),
+            sessionDriver: driver
+        )
+
+        try await kit.openThread(
+            id: "thread-compact",
+            configuration: ThreadConfiguration(instructions: "Compact on demand.")
+        )
+
+        let report = try await kit.compact(threadID: "thread-compact")
+        let memories = try await memoryStore.load(threadID: "thread-compact")
+
+        #expect(report.reducersApplied.contains(.toolPayloadDigester))
+        #expect(await blobStore.count() == 1)
+        #expect(memories.contains { $0.kind == .blobRef })
+    }
+
+    @Test("Reset deletes blobs")
+    func resetDeletesBlobs() async throws {
+        let driver = FakeSessionDriver()
+        let threadStore = InMemoryThreadStore()
+        let memoryStore = InMemoryMemoryStore()
+        let blobStore = InspectableBlobStore()
+        let blobID = try await blobStore.put(Data("blob".utf8))
+        let persisted = PersistedThreadState(
+            threadID: "thread-reset-blobs",
+            instructions: "Cleanup blobs.",
+            localeIdentifier: "en_US",
+            model: .default,
+            turns: [
+                NormalizedTurn(
+                    role: .assistant,
+                    text: "Spilled content",
+                    priority: 800,
+                    tags: ["response"],
+                    blobIDs: [blobID],
+                    windowIndex: 0
+                )
+            ]
+        )
+        try await threadStore.save(persisted, threadID: persisted.threadID)
+        try await memoryStore.save(
+            [
+                DurableMemoryRecord(
+                    kind: .blobRef,
+                    text: "Blob \(blobID.uuidString)",
+                    priority: 250,
+                    tags: ["blob"],
+                    blobIDs: [blobID]
+                )
+            ],
+            threadID: persisted.threadID
+        )
+
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                persistence: PersistencePolicy(
+                    threads: threadStore,
+                    memories: memoryStore,
+                    blobs: blobStore
+                ),
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            ),
+            sessionDriver: driver
+        )
+
+        try await kit.openThread(
+            id: "thread-reset-blobs",
+            configuration: ThreadConfiguration(instructions: "Cleanup blobs.")
+        )
+        try await kit.resetThread(threadID: "thread-reset-blobs")
+
+        #expect(await blobStore.count() == 0)
+    }
+
+    @Test("Structured compaction honors memory extraction policy")
+    func memoryExtractionPolicy() async throws {
+        let driver = FakeSessionDriver(summaryText: "summarized thread")
+        let threadStore = InMemoryThreadStore()
+        let memoryStore = InMemoryMemoryStore()
+        let blobStore = InspectableBlobStore()
+        let persisted = PersistedThreadState(
+            threadID: "thread-no-memory",
+            instructions: "Summarize without extracting durable memories.",
+            localeIdentifier: "en_US",
+            model: .default,
+            turns: [
+                NormalizedTurn(role: .user, text: "Project: Demo", priority: 950, tags: ["prompt"], windowIndex: 0),
+                NormalizedTurn(role: .assistant, text: "We decided to use actors.", priority: 800, tags: ["response"], windowIndex: 0),
+                NormalizedTurn(role: .user, text: "TODO: write docs.", priority: 950, tags: ["prompt"], windowIndex: 0)
+            ]
+        )
+        try await threadStore.save(persisted, threadID: persisted.threadID)
+
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                compaction: CompactionPolicy(mode: .structuredSummary, maxRecentTurns: 0),
+                memory: MemoryPolicy(
+                    automaticallyExtractMemories: false,
+                    retrievalLimit: 5,
+                    inlineBlobByteLimit: 128
+                ),
+                persistence: PersistencePolicy(
+                    threads: threadStore,
+                    memories: memoryStore,
+                    blobs: blobStore
+                ),
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            ),
+            sessionDriver: driver
+        )
+
+        try await kit.openThread(
+            id: "thread-no-memory",
+            configuration: ThreadConfiguration(instructions: "Summarize without extracting durable memories.")
+        )
+
+        let report = try await kit.compact(threadID: "thread-no-memory")
+        let memories = try await memoryStore.load(threadID: "thread-no-memory")
+
+        #expect(report.summaryCreated)
+        #expect(memories.isEmpty)
+    }
+
+    @Test("Unavailable model maps to typed error")
+    func unavailableModelError() async throws {
+        let driver = FakeSessionDriver(availabilityValue: .unavailable("model unavailable"))
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-model-error",
+            configuration: ThreadConfiguration(instructions: "Test unavailable model")
+        )
+
+        await #expect(throws: LanguageModelContextKitError.modelUnavailable("model unavailable")) {
+            _ = try await kit.estimateBudget(for: "Hello", threadID: "thread-model-error")
+        }
+    }
+
+    @Test("Unsupported locale maps to typed error")
+    func unsupportedLocaleError() async throws {
+        let driver = FakeSessionDriver(localeSupported: false)
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-locale-error",
+            configuration: ThreadConfiguration(
+                instructions: "Test locale",
+                locale: Locale(identifier: "fr_FR")
+            )
+        )
+
+        await #expect(throws: LanguageModelContextKitError.unsupportedLocale("Locale fr_FR is unsupported")) {
+            _ = try await kit.estimateBudget(for: "Bonjour", threadID: "thread-locale-error")
+        }
+    }
+
     @Test("Heuristic token counter reports approximate budget")
     func heuristicTokenCounter() {
         let counter = HeuristicTokenCounter()
@@ -153,9 +413,74 @@ struct LanguageModelContextKitTests {
             schemaDescription: nil
         )
 
-        let budget = counter.estimate(snapshot: snapshot, budgetPolicy: .default)
+        let budget = counter.estimate(
+            snapshot: snapshot,
+            budgetPolicy: .default,
+            contextWindowTokens: 4096
+        )
         #expect(budget.accuracy == .approximate)
         #expect(budget.estimatedInputTokens > 0)
+    }
+
+    @Test("Exact budget estimator and runtime window are honored")
+    func exactBudgetEstimatorAndRuntimeWindow() async throws {
+        let driver = FakeSessionDriver(
+            contextWindowTokensValue: 3072,
+            exactBudgetEstimatorValue: FixedExactBudgetEstimator(
+                estimatedInputTokens: 333,
+                breakdown: [.currentPrompt: 111, .instructions: 222]
+            )
+        )
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-exact-budget",
+            configuration: ThreadConfiguration(instructions: "Use exact estimator.")
+        )
+
+        let budget = try await kit.estimateBudget(
+            for: "Budget this prompt",
+            threadID: "thread-exact-budget"
+        )
+
+        #expect(budget.accuracy == .exact)
+        #expect(budget.contextWindowTokens == 3072)
+        #expect(budget.estimatedInputTokens == 333)
+    }
+
+    @Test("Logical thread survives three bridged windows")
+    func threeBridgedWindows() async throws {
+        let state = FakeDriverState(
+            sessions: [
+                ScriptedSessionHandle(textResponses: [.failure(.exceededContextWindowSize("overflow-1"))]),
+                ScriptedSessionHandle(textResponses: [.success("First ok"), .failure(.exceededContextWindowSize("overflow-2"))]),
+                ScriptedSessionHandle(textResponses: [.success("Second ok"), .failure(.exceededContextWindowSize("overflow-3"))]),
+                ScriptedSessionHandle(textResponses: [.success("Third ok")])
+            ]
+        )
+        let driver = FakeSessionDriver(state: state)
+        let kit = makeKit(driver: driver)
+
+        try await kit.openThread(
+            id: "thread-three-bridges",
+            configuration: ThreadConfiguration(instructions: "Carry forward prior context between bridged windows.")
+        )
+
+        let first = try await kit.respond(to: "First prompt", threadID: "thread-three-bridges")
+        let second = try await kit.respond(to: "Second prompt", threadID: "thread-three-bridges")
+        let third = try await kit.respond(to: "Third prompt", threadID: "thread-three-bridges")
+
+        let diagnostics = await kit.diagnostics(threadID: "thread-three-bridges")
+        let seeds = await state.recordedSeeds()
+
+        #expect(first.text == "First ok")
+        #expect(second.text == "Second ok")
+        #expect(third.text == "Third ok")
+        #expect(diagnostics?.windowIndex == 3)
+        #expect(diagnostics?.turnCount == 6)
+        #expect(seeds.count == 4)
+        #expect(seeds[2].instructions?.contains("First ok") == true)
+        #expect(seeds[3].instructions?.contains("Second ok") == true)
     }
 
     @Test("Keyword retriever ranks overlapping memories")
@@ -266,23 +591,33 @@ private actor FakeDriverState {
         }
         return sessions.removeFirst()
     }
+
+    func recordedSeeds() -> [SessionSeed] {
+        seeds
+    }
 }
 
 private struct FakeSessionDriver: SessionDriving {
     let availabilityValue: ModelAvailability
     let localeSupported: Bool
     let summaryText: String?
+    let contextWindowTokensValue: Int?
+    let exactBudgetEstimatorValue: (any ExactBudgetEstimating)?
     let state: FakeDriverState
 
     init(
         availabilityValue: ModelAvailability = .available,
         localeSupported: Bool = true,
         summaryText: String? = "summary",
+        contextWindowTokensValue: Int? = nil,
+        exactBudgetEstimatorValue: (any ExactBudgetEstimating)? = nil,
         state: FakeDriverState = FakeDriverState()
     ) {
         self.availabilityValue = availabilityValue
         self.localeSupported = localeSupported
         self.summaryText = summaryText
+        self.contextWindowTokensValue = contextWindowTokensValue
+        self.exactBudgetEstimatorValue = exactBudgetEstimatorValue
         self.state = state
     }
 
@@ -292,6 +627,14 @@ private struct FakeSessionDriver: SessionDriving {
 
     func supportsLocale(_ locale: Locale?, policy: ModelPolicy) -> Bool {
         localeSupported
+    }
+
+    func contextWindowTokens(for policy: ModelPolicy) -> Int? {
+        contextWindowTokensValue
+    }
+
+    func exactBudgetEstimator(for policy: ModelPolicy) -> (any ExactBudgetEstimating)? {
+        exactBudgetEstimatorValue
     }
 
     func makeSession(
@@ -308,7 +651,8 @@ private struct FakeSessionDriver: SessionDriving {
     func summarize(
         turns: [NormalizedTurn],
         policy: ModelPolicy,
-        locale: Locale?
+        locale: Locale?,
+        maximumResponseTokens: Int?
     ) async -> String? {
         summaryText
     }
@@ -357,5 +701,49 @@ private actor ScriptedSessionHandle: SessionHandle {
             throw SessionFailure.generationFailed("Type mismatch for structured response")
         }
         return SessionStructuredResult(content: typedValue, transcriptText: transcript)
+    }
+}
+
+private actor InspectableBlobStore: BlobStore {
+    private var storage: [UUID: Data] = [:]
+
+    func put(_ data: Data) async throws -> UUID {
+        let id = UUID()
+        storage[id] = data
+        return id
+    }
+
+    func get(_ id: UUID) async throws -> Data? {
+        storage[id]
+    }
+
+    func delete(_ id: UUID) async throws {
+        storage.removeValue(forKey: id)
+    }
+
+    func count() -> Int {
+        storage.count
+    }
+}
+
+private struct FixedExactBudgetEstimator: ExactBudgetEstimating {
+    let estimatedInputTokens: Int
+    let breakdown: [BudgetComponent: Int]
+
+    func estimate(
+        snapshot: ContextSnapshot,
+        budgetPolicy: BudgetPolicy,
+        contextWindowTokens: Int
+    ) -> BudgetReport? {
+        BudgetReport(
+            accuracy: .exact,
+            contextWindowTokens: contextWindowTokens,
+            estimatedInputTokens: estimatedInputTokens,
+            reservedOutputTokens: budgetPolicy.reservedOutputTokens,
+            projectedTotalTokens: estimatedInputTokens + budgetPolicy.reservedOutputTokens,
+            softLimitTokens: Int(Double(contextWindowTokens) * budgetPolicy.preemptiveCompactionFraction),
+            emergencyLimitTokens: Int(Double(contextWindowTokens) * budgetPolicy.emergencyFraction),
+            breakdown: breakdown.merging([.outputReserve: budgetPolicy.reservedOutputTokens]) { current, _ in current }
+        )
     }
 }

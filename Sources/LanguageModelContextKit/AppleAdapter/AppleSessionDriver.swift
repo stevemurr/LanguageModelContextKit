@@ -30,6 +30,14 @@ struct AppleSessionDriver: SessionDriving {
         return makeModel(policy: policy).supportsLocale(locale)
     }
 
+    func contextWindowTokens(for policy: ModelPolicy) -> Int? {
+        4096
+    }
+
+    func exactBudgetEstimator(for policy: ModelPolicy) -> (any ExactBudgetEstimating)? {
+        nil
+    }
+
     func makeSession(
         seed: SessionSeed,
         tools: [any Tool],
@@ -47,7 +55,8 @@ struct AppleSessionDriver: SessionDriving {
     func summarize(
         turns: [NormalizedTurn],
         policy: ModelPolicy,
-        locale _: Locale?
+        locale _: Locale?,
+        maximumResponseTokens: Int?
     ) async -> String? {
         guard case .available = availability(for: policy), !turns.isEmpty else {
             return nil
@@ -64,7 +73,7 @@ struct AppleSessionDriver: SessionDriving {
             let prompt = turns.map { "\($0.role.rawValue.capitalized): \($0.text)" }.joined(separator: "\n")
             let result = try await handle.respondText(
                 to: prompt,
-                maximumResponseTokens: 256
+                maximumResponseTokens: maximumResponseTokens ?? 256
             )
             return result.text
         } catch {
