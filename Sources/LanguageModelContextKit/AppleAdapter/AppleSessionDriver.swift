@@ -60,7 +60,7 @@ struct AppleSessionDriver: SessionDriving {
     }
 
     func contextWindowTokens(for policy: ModelPolicy) -> Int? {
-        4096
+        nil
     }
 
     func exactBudgetEstimator(for policy: ModelPolicy) -> (any ExactBudgetEstimating)? {

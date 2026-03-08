@@ -13,13 +13,17 @@
 Add the package to your SwiftPM dependencies:
 
 ```swift
-.package(url: "https://github.com/stevemurr/language-model-context-kit", branch: "main")
+.package(
+    name: "LanguageModelContextKit",
+    url: "https://github.com/stevemurr/LanguageModelContextKit.git",
+    branch: "main"
+)
 ```
 
 Then depend on the product:
 
 ```swift
-.product(name: "LanguageModelContextKit", package: "language-model-context-kit")
+.product(name: "LanguageModelContextKit", package: "LanguageModelContextKit")
 ```
 
 ## Quick Start
@@ -232,6 +236,7 @@ try await kit.importThread(
 ```
 
 Imported turns are sorted by `createdAt`, existing `windowIndex` values are preserved, persisted durable memory is written through the configured memory store, and any live in-memory session is invalidated so the next call rehydrates from imported state.
+Re-importing the same imported records is idempotent for matching turns and durable memories.
 
 ## External Mutations and Inspection
 
@@ -255,4 +260,4 @@ Appending turns or memories does not trigger compaction. It updates persisted th
 - Call `openThread` after app launch or resume for any thread that uses tools, because tool implementations are runtime-only.
 - The library persists normalized turns and durable memories, not Foundation transcript objects.
 - Structured calls persist assistant text from `transcriptRenderer(content)` when provided; otherwise they persist the adapter transcript text.
-- Heuristic token counting is active by default; the exact-counting seam is present for future SDK support.
+- Exact budgeting still falls back to heuristics today because Foundation Models does not currently expose public token-count or context-window APIs that the package can bind to.

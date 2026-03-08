@@ -73,7 +73,7 @@ public actor LanguageModelContextKit {
         let existingState = try await loadedThreadState(threadID: id)
         let existingMemories = replaceExisting ? [] : try await configuration.persistence.memories.load(threadID: id)
         let combinedTurns = replaceExisting ? turns : (existingState?.turns ?? []) + turns
-        let sortedTurns = combinedTurns.sorted(by: Self.sortTurnsByCreatedAt)
+        let sortedTurns = deduplicatedImportedTurns(combinedTurns)
         let createdAt = existingState?.createdAt ?? Date()
         let activeWindowIndex = max(
             existingState?.activeWindowIndex ?? 0,
@@ -93,7 +93,9 @@ public actor LanguageModelContextKit {
             updatedAt: Date()
         )
         let logicalThread = LogicalThread(state: state, configuration: threadConfiguration)
-        let mergedMemories = replaceExisting ? durableMemory : existingMemories + durableMemory
+        let mergedMemories = deduplicatedMemories(
+            replaceExisting ? durableMemory : existingMemories + durableMemory
+        )
 
         threads[id] = logicalThread
         liveSessions.removeValue(forKey: id)
@@ -1031,6 +1033,24 @@ public actor LanguageModelContextKit {
         return unique
     }
 
+    private func deduplicatedImportedTurns(
+        _ turns: [NormalizedTurn]
+    ) -> [NormalizedTurn] {
+        var seenIDs: Set<UUID> = []
+        var seenKeys: Set<ImportedTurnKey> = []
+        var unique: [NormalizedTurn] = []
+
+        for turn in turns.sorted(by: Self.sortTurnsByCreatedAt) {
+            let key = ImportedTurnKey(turn: turn)
+            guard seenIDs.insert(turn.id).inserted, seenKeys.insert(key).inserted else {
+                continue
+            }
+            unique.append(turn)
+        }
+
+        return unique
+    }
+
     private func persistedAssistantText<Content: Generable>(
         content: Content,
         transcriptText: String,
@@ -1094,6 +1114,28 @@ public actor LanguageModelContextKit {
             return lhs.createdAt < rhs.createdAt
         }
         return lhs.id.uuidString < rhs.id.uuidString
+    }
+}
+
+private struct ImportedTurnKey: Hashable {
+    let role: NormalizedTurn.Role
+    let text: String
+    let createdAt: Date
+    let priority: Int
+    let tags: [String]
+    let blobIDs: [UUID]
+    let windowIndex: Int
+    let compacted: Bool
+
+    init(turn: NormalizedTurn) {
+        role = turn.role
+        text = turn.text
+        createdAt = turn.createdAt
+        priority = turn.priority
+        tags = turn.tags
+        blobIDs = turn.blobIDs
+        windowIndex = turn.windowIndex
+        compacted = turn.compacted
     }
 }
 

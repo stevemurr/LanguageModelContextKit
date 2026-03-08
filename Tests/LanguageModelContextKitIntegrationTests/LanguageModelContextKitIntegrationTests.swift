@@ -171,6 +171,41 @@ struct LanguageModelContextKitIntegrationTests {
         #expect(state.turns.count == 2)
     }
 
+    @Test("Text streaming integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
+    func textStreaming() async throws {
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            )
+        )
+
+        try await kit.openThread(
+            id: "integration-text-stream-thread",
+            configuration: ThreadConfiguration(instructions: "Reply with one short sentence.")
+        )
+
+        var sawPartial = false
+        var completed: ManagedTextResponse?
+
+        for try await event in await kit.streamText(
+            to: "Say hello in one short sentence.",
+            threadID: "integration-text-stream-thread"
+        ) {
+            switch event {
+            case .partial(let text):
+                sawPartial = sawPartial || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            case .completed(let response):
+                completed = response
+            }
+        }
+
+        let state = try await kit.threadState(threadID: "integration-text-stream-thread")
+        #expect(sawPartial)
+        #expect(completed?.text.isEmpty == false)
+        #expect(completed?.budget.estimatedInputTokens ?? 0 > 0)
+        #expect(state.turns.count == 2)
+    }
+
     @Test("Manual compaction integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
     func manualCompaction() async throws {
         let kit = LanguageModelContextKit(
@@ -350,6 +385,92 @@ struct LanguageModelContextKitIntegrationTests {
         let state = try await kit.threadState(threadID: "integration-import-thread")
         #expect(response.text.contains("Lattice Harbor"))
         #expect(state.turns.count == 4)
+    }
+
+    @Test("Append turns continuity integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
+    func appendTurnsContinuity() async throws {
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            )
+        )
+
+        try await kit.openThread(
+            id: "integration-append-turns-thread",
+            configuration: ThreadConfiguration(
+                instructions: "Answer with the stored workspace label only."
+            )
+        )
+
+        try await kit.appendTurns(
+            [
+                NormalizedTurn(
+                    role: .user,
+                    text: "Workspace label: Harbor Mint.",
+                    createdAt: Date(timeIntervalSince1970: 10),
+                    priority: 950,
+                    windowIndex: 0
+                ),
+                NormalizedTurn(
+                    role: .assistant,
+                    text: "Stored: workspace label is Harbor Mint.",
+                    createdAt: Date(timeIntervalSince1970: 20),
+                    priority: 800,
+                    windowIndex: 0
+                )
+            ],
+            threadID: "integration-append-turns-thread"
+        )
+
+        let response = try await kit.respond(
+            to: "What is the workspace label? Reply with only the label.",
+            threadID: "integration-append-turns-thread"
+        )
+
+        let state = try await kit.threadState(threadID: "integration-append-turns-thread")
+        #expect(response.text.contains("Harbor Mint"))
+        #expect(state.turns.count == 4)
+    }
+
+    @Test("Append memories continuity integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
+    func appendMemoriesContinuity() async throws {
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            )
+        )
+
+        try await kit.openThread(
+            id: "integration-append-memories-thread",
+            configuration: ThreadConfiguration(
+                instructions: "Answer with the stored workspace label only."
+            )
+        )
+
+        try await kit.appendMemories(
+            [
+                DurableMemoryRecord(
+                    kind: .fact,
+                    text: "Workspace label: Harbor Mint",
+                    priority: 900
+                ),
+                DurableMemoryRecord(
+                    kind: .fact,
+                    text: "Workspace label: Harbor Mint",
+                    priority: 200
+                )
+            ],
+            threadID: "integration-append-memories-thread"
+        )
+
+        let response = try await kit.respond(
+            to: "What is the workspace label? Reply with only the label.",
+            threadID: "integration-append-memories-thread"
+        )
+
+        let memories = try await kit.durableMemories(threadID: "integration-append-memories-thread")
+        #expect(response.text.contains("Harbor Mint"))
+        #expect(memories.count == 1)
     }
 
     @Test("Overflow retry after imported and appended state", .disabled(if: !SystemLanguageModel.default.isAvailable))

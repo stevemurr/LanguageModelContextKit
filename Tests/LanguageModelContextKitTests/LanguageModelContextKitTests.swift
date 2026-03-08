@@ -698,6 +698,43 @@ struct LanguageModelContextKitTests {
         #expect(budget.estimatedInputTokens == 333)
     }
 
+    @Test("Configured default context window is used when driver does not provide one")
+    func configuredDefaultContextWindow() async throws {
+        let driver = FakeSessionDriver(contextWindowTokensValue: nil)
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                budget: BudgetPolicy(
+                    reservedOutputTokens: 64,
+                    preemptiveCompactionFraction: 0.78,
+                    emergencyFraction: 0.90,
+                    maxBridgeRetries: 1,
+                    exactCountingPreferred: false,
+                    heuristicSafetyMultiplier: 1.10,
+                    defaultContextWindowTokens: 1234
+                ),
+                persistence: PersistencePolicy(
+                    threads: InMemoryThreadStore(),
+                    memories: InMemoryMemoryStore(),
+                    blobs: InMemoryBlobStore()
+                ),
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            ),
+            sessionDriver: driver
+        )
+
+        try await kit.openThread(
+            id: "thread-default-window",
+            configuration: ThreadConfiguration(instructions: "Use configured window size.")
+        )
+
+        let budget = try await kit.estimateBudget(
+            for: "Budget this prompt",
+            threadID: "thread-default-window"
+        )
+
+        #expect(budget.contextWindowTokens == 1234)
+    }
+
     @Test("Logical thread survives three bridged windows")
     func threeBridgedWindows() async throws {
         let state = FakeDriverState(
@@ -843,6 +880,80 @@ struct LanguageModelContextKitTests {
         #expect(seeds.count == 1)
         #expect(seeds[0].instructions?.contains("Earlier answer") == true)
         #expect(finalState.turns.count == 4)
+    }
+
+    @Test("Importing the same history twice is idempotent")
+    func importThreadIdempotent() async throws {
+        let kit = makeKit(driver: FakeSessionDriver())
+        let firstTurns = [
+            NormalizedTurn(
+                role: .user,
+                text: "Earlier question",
+                createdAt: Date(timeIntervalSince1970: 10),
+                priority: 950,
+                windowIndex: 0
+            ),
+            NormalizedTurn(
+                role: .assistant,
+                text: "Earlier answer",
+                createdAt: Date(timeIntervalSince1970: 20),
+                priority: 800,
+                windowIndex: 0
+            )
+        ]
+        let secondTurns = [
+            NormalizedTurn(
+                role: .user,
+                text: "Earlier question",
+                createdAt: Date(timeIntervalSince1970: 10),
+                priority: 950,
+                windowIndex: 0
+            ),
+            NormalizedTurn(
+                role: .assistant,
+                text: "Earlier answer",
+                createdAt: Date(timeIntervalSince1970: 20),
+                priority: 800,
+                windowIndex: 0
+            )
+        ]
+        let firstMemories = [
+            DurableMemoryRecord(
+                kind: .fact,
+                text: "Imported fact",
+                priority: 900
+            )
+        ]
+        let secondMemories = [
+            DurableMemoryRecord(
+                kind: .fact,
+                text: "Imported fact",
+                priority: 100
+            )
+        ]
+
+        try await kit.importThread(
+            id: "thread-import-idempotent",
+            configuration: ThreadConfiguration(instructions: "Continue imported context."),
+            turns: firstTurns,
+            durableMemory: firstMemories,
+            replaceExisting: false
+        )
+        try await kit.importThread(
+            id: "thread-import-idempotent",
+            configuration: ThreadConfiguration(instructions: "Continue imported context."),
+            turns: secondTurns,
+            durableMemory: secondMemories,
+            replaceExisting: false
+        )
+
+        let state = try await kit.threadState(threadID: "thread-import-idempotent")
+        let memories = try await kit.durableMemories(threadID: "thread-import-idempotent")
+
+        #expect(state.turns.count == 2)
+        #expect(state.turns.map(\.text) == ["Earlier question", "Earlier answer"])
+        #expect(memories.count == 1)
+        #expect(memories.first?.text == "Imported fact")
     }
 
     @Test("Appending turns invalidates live session and preserves continuity")
