@@ -10,6 +10,19 @@ private let unsupportedLocaleForIntegration = [
     Locale(identifier: "qya")
 ].first { !SystemLanguageModel.default.supportsLocale($0) }
 
+private let liveModelPolicies: [(name: String, policy: ModelPolicy)] = [
+    ("general-default", ModelPolicy(useCase: .general, guardrails: .default)),
+    (
+        "general-permissive",
+        ModelPolicy(useCase: .general, guardrails: .permissiveContentTransformations)
+    ),
+    ("content-tagging-default", ModelPolicy(useCase: .contentTagging, guardrails: .default)),
+    (
+        "content-tagging-permissive",
+        ModelPolicy(useCase: .contentTagging, guardrails: .permissiveContentTransformations)
+    )
+]
+
 @Generable(description: "A short greeting payload.")
 private struct GreetingPayload {
     var message: String
@@ -17,6 +30,68 @@ private struct GreetingPayload {
 
 @Suite("LanguageModelContextKitIntegration")
 struct LanguageModelContextKitIntegrationTests {
+    @Test("Foundation Models policy matrix", .disabled(if: !SystemLanguageModel.default.isAvailable))
+    func foundationModelsPolicyMatrix() async throws {
+        for (name, policy) in liveModelPolicies {
+            let model = makeSystemLanguageModel(for: policy)
+            #expect(model.isAvailable)
+
+            let session = LanguageModelSession(
+                model: model,
+                instructions: "Return exactly one short label."
+            )
+            let response = try await session.respond(
+                to: "Label this text in one or two words: Fresh green apple.",
+                options: GenerationOptions(
+                    sampling: .greedy,
+                    maximumResponseTokens: 24
+                )
+            )
+
+            let text = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            #expect(text.isEmpty == false, "Expected non-empty response for \(name)")
+        }
+    }
+
+    @Test("Context kit policy matrix", .disabled(if: !SystemLanguageModel.default.isAvailable))
+    func contextKitPolicyMatrix() async throws {
+        let kit = LanguageModelContextKit(
+            configuration: ContextManagerConfiguration(
+                diagnostics: DiagnosticsPolicy(isEnabled: false, logToOSLog: false)
+            )
+        )
+
+        for (name, policy) in liveModelPolicies {
+            let threadID = "policy-\(name)"
+            try await kit.openThread(
+                id: threadID,
+                configuration: ThreadConfiguration(
+                    instructions: "Return concise labels.",
+                    locale: Locale(identifier: "en_US"),
+                    model: policy
+                )
+            )
+
+            let budget = try await kit.estimateBudget(
+                for: "Label this text in one or two words: Fresh green apple.",
+                threadID: threadID
+            )
+            #expect(budget.estimatedInputTokens > 0, "Expected budget for \(name)")
+
+            let textResponse = try await kit.respond(
+                to: "Label this text in one or two words: Fresh green apple.",
+                threadID: threadID
+            )
+            #expect(
+                textResponse.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+                "Expected text response for \(name)"
+            )
+
+            let diagnostics = await kit.diagnostics(threadID: threadID)
+            #expect(diagnostics?.lastBudget != nil, "Expected diagnostics budget for \(name)")
+        }
+    }
+
     @Test("Short thread integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
     func shortThread() async throws {
         let kit = LanguageModelContextKit(
@@ -191,4 +266,22 @@ struct LanguageModelContextKitIntegrationTests {
             }
         }
     }
+}
+
+private func makeSystemLanguageModel(for policy: ModelPolicy) -> SystemLanguageModel {
+    let useCase: SystemLanguageModel.UseCase = switch policy.useCase {
+    case .general:
+        .general
+    case .contentTagging:
+        .contentTagging
+    }
+
+    let guardrails: SystemLanguageModel.Guardrails = switch policy.guardrails {
+    case .default:
+        .default
+    case .permissiveContentTransformations:
+        .permissiveContentTransformations
+    }
+
+    return SystemLanguageModel(useCase: useCase, guardrails: guardrails)
 }
