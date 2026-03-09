@@ -2,6 +2,8 @@ import Foundation
 import FoundationModels
 
 public actor LanguageModelContextKit {
+    public typealias Configuration = ContextManagerConfiguration
+
     private let configuration: ContextManagerConfiguration
     private let sessionDriver: any SessionDriving
     private let tokenCounterFactory: TokenCounterFactory
@@ -29,18 +31,37 @@ public actor LanguageModelContextKit {
         self.logger = DiagnosticsLogger(policy: configuration.diagnostics)
     }
 
-    public func availabilityStatus(for policy: ModelPolicy = .default) async -> AvailabilityStatus {
-        sessionDriver.availability(for: policy).publicStatus
+    public func session(
+        id: String = UUID().uuidString,
+        configuration sessionConfiguration: SessionConfiguration = .init()
+    ) async throws -> ContextSession {
+        try await openThread(id: id, configuration: sessionConfiguration)
+        return ContextSession(runtime: self, id: id)
+    }
+
+    public func availability(for model: ModelPolicy = .default) async -> AvailabilityStatus {
+        await availabilityStatus(for: model)
     }
 
     public func supportsLocale(
+        _ locale: Locale?,
+        for model: ModelPolicy = .default
+    ) async -> Bool {
+        await supportsLocaleInternal(locale, policy: model)
+    }
+
+    func availabilityStatus(for policy: ModelPolicy = .default) async -> AvailabilityStatus {
+        sessionDriver.availability(for: policy).publicStatus
+    }
+
+    func supportsLocaleInternal(
         _ locale: Locale?,
         policy: ModelPolicy = .default
     ) async -> Bool {
         sessionDriver.supportsLocale(locale, policy: policy)
     }
 
-    public func openThread(
+    func openThread(
         id: String,
         configuration threadConfiguration: ThreadConfiguration
     ) async throws {
@@ -63,7 +84,7 @@ public actor LanguageModelContextKit {
         try await self.configuration.persistence.threads.save(updatedState, threadID: id)
     }
 
-    public func importThread(
+    func importThread(
         id: String,
         configuration threadConfiguration: ThreadConfiguration,
         turns: [NormalizedTurn],
@@ -102,7 +123,7 @@ public actor LanguageModelContextKit {
         try await persist(thread: logicalThread, durableMemory: mergedMemories)
     }
 
-    public func appendTurns(
+    func appendTurns(
         _ turns: [NormalizedTurn],
         threadID: String
     ) async throws {
@@ -119,7 +140,7 @@ public actor LanguageModelContextKit {
         liveSessions.removeValue(forKey: threadID)
     }
 
-    public func appendMemories(
+    func appendMemories(
         _ records: [DurableMemoryRecord],
         threadID: String,
         deduplicate: Bool = true
@@ -137,20 +158,36 @@ public actor LanguageModelContextKit {
         liveSessions.removeValue(forKey: threadID)
     }
 
-    public func threadState(
+    func importHistory(
+        _ turns: [NormalizedTurn],
+        durableMemory: [DurableMemoryRecord],
+        replaceExisting: Bool,
+        threadID: String
+    ) async throws {
+        let logicalThread = try await requireThread(threadID)
+        try await importThread(
+            id: threadID,
+            configuration: logicalThread.configuration,
+            turns: turns,
+            durableMemory: durableMemory,
+            replaceExisting: replaceExisting
+        )
+    }
+
+    func threadState(
         threadID: String
     ) async throws -> PersistedThreadState {
         try await requireThreadState(threadID: threadID)
     }
 
-    public func durableMemories(
+    func durableMemories(
         threadID: String
     ) async throws -> [DurableMemoryRecord] {
         _ = try await requireThreadState(threadID: threadID)
         return try await configuration.persistence.memories.load(threadID: threadID)
     }
 
-    public func estimateBudget(
+    func estimateBudget(
         for prompt: String,
         threadID: String
     ) async throws -> BudgetReport {
@@ -163,7 +200,7 @@ public actor LanguageModelContextKit {
         )
     }
 
-    public func respond(
+    func respond(
         to prompt: String,
         threadID: String
     ) async throws -> ManagedTextResponse {
@@ -242,7 +279,7 @@ public actor LanguageModelContextKit {
         }
     }
 
-    public func respondManaged<Content: Generable>(
+    func respondManaged<Content: Generable>(
         to prompt: String,
         generating type: Content.Type,
         threadID: String,
@@ -328,7 +365,7 @@ public actor LanguageModelContextKit {
         }
     }
 
-    public func respond<T: Generable>(
+    func respond<T: Generable>(
         to prompt: String,
         generating type: T.Type,
         threadID: String,
@@ -344,7 +381,7 @@ public actor LanguageModelContextKit {
         ).content
     }
 
-    public func streamText(
+    func streamText(
         to prompt: String,
         threadID: String
     ) -> AsyncThrowingStream<ManagedTextStreamEvent, Error> {
@@ -370,7 +407,7 @@ public actor LanguageModelContextKit {
         }
     }
 
-    public func streamManaged<Content: Generable>(
+    func streamManaged<Content: Generable>(
         to prompt: String,
         generating type: Content.Type,
         threadID: String,
@@ -402,7 +439,7 @@ public actor LanguageModelContextKit {
         }
     }
 
-    public func compact(
+    func compact(
         threadID: String
     ) async throws -> CompactionReport {
         let logicalThread = try await requireThread(threadID)
@@ -429,7 +466,7 @@ public actor LanguageModelContextKit {
         return report
     }
 
-    public func diagnostics(
+    func diagnostics(
         threadID: String
     ) async -> ThreadDiagnostics? {
         guard let logicalThread = threads[threadID] else {
@@ -462,7 +499,7 @@ public actor LanguageModelContextKit {
         )
     }
 
-    public func resetThread(
+    func resetThread(
         threadID: String
     ) async throws {
         let persisted = try await configuration.persistence.threads.load(threadID: threadID)

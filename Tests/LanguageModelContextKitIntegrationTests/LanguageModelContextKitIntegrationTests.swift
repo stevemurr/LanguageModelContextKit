@@ -62,33 +62,25 @@ struct LanguageModelContextKitIntegrationTests {
         )
 
         for (name, policy) in liveModelPolicies {
-            let threadID = "policy-\(name)"
-            try await kit.openThread(
-                id: threadID,
-                configuration: ThreadConfiguration(
+            let session = try await kit.session(
+                id: "policy-\(name)",
+                configuration: SessionConfiguration(
                     instructions: "Return concise labels.",
                     locale: Locale(identifier: "en_US"),
                     model: policy
                 )
             )
 
-            let budget = try await kit.estimateBudget(
-                for: "Label this text in one or two words: Fresh green apple.",
-                threadID: threadID
-            )
-            #expect(budget.estimatedInputTokens > 0, "Expected budget for \(name)")
-
-            let textResponse = try await kit.respond(
-                to: "Label this text in one or two words: Fresh green apple.",
-                threadID: threadID
+            let textResponse = try await session.reply(
+                to: "Label this text in one or two words: Fresh green apple."
             )
             #expect(
                 textResponse.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
                 "Expected text response for \(name)"
             )
 
-            let diagnostics = await kit.diagnostics(threadID: threadID)
-            #expect(diagnostics?.lastBudget != nil, "Expected diagnostics budget for \(name)")
+            let diagnostics = await session.inspection.diagnostics()
+            #expect(diagnostics?.turnCount == 2, "Expected persisted turns for \(name)")
         }
     }
 
@@ -100,17 +92,14 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-thread",
-            configuration: ThreadConfiguration(instructions: "Reply with exactly one short sentence.")
+            configuration: SessionConfiguration(instructions: "Reply with exactly one short sentence.")
         )
 
-        let response = try await kit.respond(
-            to: "Say hello",
-            threadID: "integration-thread"
-        )
+        let response = try await session.respond("Say hello")
 
-        #expect(response.text.isEmpty == false)
+        #expect(response.isEmpty == false)
     }
 
     @Test("Structured response integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
@@ -121,15 +110,14 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-structured-thread",
-            configuration: ThreadConfiguration(instructions: "Return concise structured content.")
+            configuration: SessionConfiguration(instructions: "Return concise structured content.")
         )
 
-        let payload = try await kit.respond(
-            to: "Return a short greeting in the message field.",
-            generating: GreetingPayload.self,
-            threadID: "integration-structured-thread"
+        let payload = try await session.generate(
+            "Return a short greeting in the message field.",
+            as: GreetingPayload.self
         )
 
         #expect(payload.message.isEmpty == false)
@@ -143,18 +131,17 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-structured-stream-thread",
-            configuration: ThreadConfiguration(instructions: "Return concise structured content.")
+            configuration: SessionConfiguration(instructions: "Return concise structured content.")
         )
 
         var sawPartial = false
-        var completed: ManagedStructuredResponse<GreetingPayload>?
+        var completed: GeneratedReply<GreetingPayload>?
 
-        for try await event in await kit.streamManaged(
-            to: "Return a greeting of six to ten words in the message field.",
-            generating: GreetingPayload.self,
-            threadID: "integration-structured-stream-thread"
+        for try await event in session.stream(
+            "Return a greeting of six to ten words in the message field.",
+            as: GreetingPayload.self
         ) {
             switch event {
             case .partial:
@@ -164,11 +151,10 @@ struct LanguageModelContextKitIntegrationTests {
             }
         }
 
-        let state = try await kit.threadState(threadID: "integration-structured-stream-thread")
+        let history = try await session.inspection.history()
         #expect(sawPartial)
-        #expect(completed?.content.message.isEmpty == false)
-        #expect(completed?.budget.estimatedInputTokens ?? 0 > 0)
-        #expect(state.turns.count == 2)
+        #expect(completed?.value.message.isEmpty == false)
+        #expect(history.count == 2)
     }
 
     @Test("Text streaming integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
@@ -179,17 +165,16 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-text-stream-thread",
-            configuration: ThreadConfiguration(instructions: "Reply with one short sentence.")
+            configuration: SessionConfiguration(instructions: "Reply with one short sentence.")
         )
 
         var sawPartial = false
-        var completed: ManagedTextResponse?
+        var completed: TextReply?
 
-        for try await event in await kit.streamText(
-            to: "Say hello in one short sentence.",
-            threadID: "integration-text-stream-thread"
+        for try await event in session.stream(
+            "Say hello in one short sentence."
         ) {
             switch event {
             case .partial(let text):
@@ -199,11 +184,10 @@ struct LanguageModelContextKitIntegrationTests {
             }
         }
 
-        let state = try await kit.threadState(threadID: "integration-text-stream-thread")
+        let history = try await session.inspection.history()
         #expect(sawPartial)
         #expect(completed?.text.isEmpty == false)
-        #expect(completed?.budget.estimatedInputTokens ?? 0 > 0)
-        #expect(state.turns.count == 2)
+        #expect(history.count == 2)
     }
 
     @Test("Manual compaction integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
@@ -230,24 +214,18 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-compaction-thread",
-            configuration: ThreadConfiguration(
+            configuration: SessionConfiguration(
                 instructions: "Answer briefly and preserve decisions, tasks, and constraints."
             )
         )
 
-        _ = try await kit.respond(
-            to: "We decided to use actors. Keep the README concise. TODO: polish diagnostics docs.",
-            threadID: "integration-compaction-thread"
-        )
-        _ = try await kit.respond(
-            to: "Reminder: keep examples short and preserve the project name LanguageModelContextKit.",
-            threadID: "integration-compaction-thread"
-        )
+        _ = try await session.respond("We decided to use actors. Keep the README concise. TODO: polish diagnostics docs.")
+        _ = try await session.respond("Reminder: keep examples short and preserve the project name LanguageModelContextKit.")
 
-        let report = try await kit.compact(threadID: "integration-compaction-thread")
-        let diagnostics = await kit.diagnostics(threadID: "integration-compaction-thread")
+        let report = try await session.maintenance.compact()
+        let diagnostics = await session.inspection.diagnostics()
 
         #expect(report.summaryCreated)
         #expect(report.reducersApplied.contains(.structuredSummary))
@@ -266,19 +244,16 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-unsupported-locale",
-            configuration: ThreadConfiguration(
+            configuration: SessionConfiguration(
                 instructions: "Respond briefly.",
                 locale: locale
             )
         )
 
         do {
-            _ = try await kit.estimateBudget(
-                for: "Bonjour",
-                threadID: "integration-unsupported-locale"
-            )
+            _ = try await session.respond("Bonjour")
             Issue.record("Expected unsupported locale error for \(locale.identifier)")
         } catch let error as LanguageModelContextKitError {
             switch error {
@@ -307,9 +282,9 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-overflow-thread",
-            configuration: ThreadConfiguration(
+            configuration: SessionConfiguration(
                 instructions: "If possible, answer in one short sentence."
             )
         )
@@ -320,10 +295,7 @@ struct LanguageModelContextKitIntegrationTests {
         ).joined(separator: " ")
 
         do {
-            _ = try await kit.respond(
-                to: oversizedPrompt,
-                threadID: "integration-overflow-thread"
-            )
+            _ = try await session.respond(oversizedPrompt)
             Issue.record("Expected budget exhaustion after overflow retry")
         } catch let error as LanguageModelContextKitError {
             switch error {
@@ -346,12 +318,15 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.importThread(
+        let session = try await kit.session(
             id: "integration-import-thread",
-            configuration: ThreadConfiguration(
+            configuration: SessionConfiguration(
                 instructions: "Answer with the imported workspace label only."
-            ),
-            turns: [
+            )
+        )
+
+        try await session.maintenance.importHistory(
+            [
                 NormalizedTurn(
                     role: .user,
                     text: "Workspace label: Lattice Harbor.",
@@ -377,14 +352,13 @@ struct LanguageModelContextKitIntegrationTests {
             replaceExisting: true
         )
 
-        let response = try await kit.respond(
-            to: "What is the workspace label? Reply with only the label.",
-            threadID: "integration-import-thread"
+        let response = try await session.respond(
+            "What is the workspace label? Reply with only the label."
         )
 
-        let state = try await kit.threadState(threadID: "integration-import-thread")
-        #expect(response.text.contains("Lattice Harbor"))
-        #expect(state.turns.count == 4)
+        let history = try await session.inspection.history()
+        #expect(response.contains("Lattice Harbor"))
+        #expect(history.count == 4)
     }
 
     @Test("Append turns continuity integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
@@ -395,14 +369,14 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-append-turns-thread",
-            configuration: ThreadConfiguration(
+            configuration: SessionConfiguration(
                 instructions: "Answer with the stored workspace label only."
             )
         )
 
-        try await kit.appendTurns(
+        try await session.maintenance.appendTurns(
             [
                 NormalizedTurn(
                     role: .user,
@@ -418,18 +392,16 @@ struct LanguageModelContextKitIntegrationTests {
                     priority: 800,
                     windowIndex: 0
                 )
-            ],
-            threadID: "integration-append-turns-thread"
+            ]
         )
 
-        let response = try await kit.respond(
-            to: "What is the workspace label? Reply with only the label.",
-            threadID: "integration-append-turns-thread"
+        let response = try await session.respond(
+            "What is the workspace label? Reply with only the label."
         )
 
-        let state = try await kit.threadState(threadID: "integration-append-turns-thread")
-        #expect(response.text.contains("Harbor Mint"))
-        #expect(state.turns.count == 4)
+        let history = try await session.inspection.history()
+        #expect(response.contains("Harbor Mint"))
+        #expect(history.count == 4)
     }
 
     @Test("Append memories continuity integration", .disabled(if: !SystemLanguageModel.default.isAvailable))
@@ -440,14 +412,14 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.openThread(
+        let session = try await kit.session(
             id: "integration-append-memories-thread",
-            configuration: ThreadConfiguration(
+            configuration: SessionConfiguration(
                 instructions: "Answer with the stored workspace label only."
             )
         )
 
-        try await kit.appendMemories(
+        try await session.maintenance.appendMemory(
             [
                 DurableMemoryRecord(
                     kind: .fact,
@@ -459,17 +431,15 @@ struct LanguageModelContextKitIntegrationTests {
                     text: "Workspace label: Harbor Mint",
                     priority: 200
                 )
-            ],
-            threadID: "integration-append-memories-thread"
+            ]
         )
 
-        let response = try await kit.respond(
-            to: "What is the workspace label? Reply with only the label.",
-            threadID: "integration-append-memories-thread"
+        let response = try await session.respond(
+            "What is the workspace label? Reply with only the label."
         )
 
-        let memories = try await kit.durableMemories(threadID: "integration-append-memories-thread")
-        #expect(response.text.contains("Harbor Mint"))
+        let memories = try await session.inspection.durableMemory()
+        #expect(response.contains("Harbor Mint"))
         #expect(memories.count == 1)
     }
 
@@ -490,12 +460,15 @@ struct LanguageModelContextKitIntegrationTests {
             )
         )
 
-        try await kit.importThread(
+        let session = try await kit.session(
             id: "integration-overflow-imported-thread",
-            configuration: ThreadConfiguration(
+            configuration: SessionConfiguration(
                 instructions: "If possible, answer in one short sentence."
-            ),
-            turns: [
+            )
+        )
+
+        try await session.maintenance.importHistory(
+            [
                 NormalizedTurn(
                     role: .user,
                     text: "Imported context before overflow.",
@@ -513,7 +486,7 @@ struct LanguageModelContextKitIntegrationTests {
             ],
             replaceExisting: true
         )
-        try await kit.appendTurns(
+        try await session.maintenance.appendTurns(
             [
                 NormalizedTurn(
                     role: .tool,
@@ -522,8 +495,7 @@ struct LanguageModelContextKitIntegrationTests {
                     tags: ["tool"],
                     windowIndex: 0
                 )
-            ],
-            threadID: "integration-overflow-imported-thread"
+            ]
         )
 
         let oversizedPrompt = Array(
@@ -532,10 +504,7 @@ struct LanguageModelContextKitIntegrationTests {
         ).joined(separator: " ")
 
         do {
-            _ = try await kit.respond(
-                to: oversizedPrompt,
-                threadID: "integration-overflow-imported-thread"
-            )
+            _ = try await session.respond(oversizedPrompt)
             Issue.record("Expected budget exhaustion after overflow retry with imported state")
         } catch let error as LanguageModelContextKitError {
             switch error {

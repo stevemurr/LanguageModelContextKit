@@ -1,6 +1,6 @@
 # LanguageModelContextKit
 
-`LanguageModelContextKit` is a Swift package that wraps Apple Foundation Models with a logical-thread API. It budgets prompts, compacts context, bridges across session windows, persists normalized state, and exposes diagnostics without making the app manage raw `LanguageModelSession` history directly.
+`LanguageModelContextKit` is a Swift package that wraps Apple Foundation Models with a logical-session API. It budgets prompts, compacts context, bridges across session windows, persists normalized state, and exposes inspection and maintenance tools without making the app manage raw `LanguageModelSession` history directly.
 
 ## Requirements
 
@@ -30,27 +30,16 @@ import LanguageModelContextKit
 
 let kit = LanguageModelContextKit()
 
-try await kit.openThread(
+let session = try await kit.session(
     id: "demo-thread",
-    configuration: ThreadConfiguration(
+    configuration: SessionConfiguration(
         instructions: "Reply concisely and preserve explicit user constraints.",
         locale: Locale(identifier: "en_US")
     )
 )
 
-let budget = try await kit.estimateBudget(
-    for: "Summarize the current task.",
-    threadID: "demo-thread"
-)
-
-print("Projected tokens:", budget.projectedTotalTokens)
-
-let response = try await kit.respond(
-    to: "Summarize the current task.",
-    threadID: "demo-thread"
-)
-
-print(response.text)
+let response = try await session.respond("Summarize the current task.")
+print(response)
 ```
 
 ## Availability
@@ -58,7 +47,7 @@ print(response.text)
 Callers can check Foundation Models readiness and locale support without reaching into adapter internals:
 
 ```swift
-switch await kit.availabilityStatus() {
+switch await kit.availability() {
 case .available:
     break
 case .unavailable(let reason):
@@ -71,7 +60,7 @@ print("French supported:", supportsFrench)
 
 ## Structured Responses
 
-Use `respondManaged` when you need structured output plus persisted metadata:
+Use `generate` for the simple typed path, or `reply(to:as:)` if you also want per-turn metadata:
 
 ```swift
 import FoundationModels
@@ -83,62 +72,53 @@ struct ProjectSummary {
     var openTasks: [String]
 }
 
-let managed = try await kit.respondManaged(
-    to: "Summarize the current project state.",
-    generating: ProjectSummary.self,
-    threadID: "demo-thread",
-    transcriptRenderer: { summary in
-        """
-        \(summary.headline)
-        Open tasks:
-        \(summary.openTasks.joined(separator: "\n"))
-        """
-    }
+let summary = try await session.generate(
+    "Summarize the current project state.",
+    as: ProjectSummary.self
 )
 
-print(managed.content.headline)
-print(managed.transcriptText)
-print(managed.budget.projectedTotalTokens)
+let reply = try await session.reply(
+    to: "Summarize the current project state.",
+    as: ProjectSummary.self
+)
+
+print(summary.headline)
+print(reply.transcriptText)
+print(reply.metadata.compaction?.summaryCreated ?? false)
 ```
 
-`respond(to:generating:threadID:includeSchemaInPrompt:transcriptRenderer:)` remains available as a convenience wrapper that returns only `managed.content`.
+Structured replies include:
 
-Managed structured responses include:
-
-- `content` for the typed payload
+- `value` for the typed payload
 - `transcriptText` for the adapter-rendered transcript/debug view
-- `budget`, `compaction`, and `bridge` metadata for the completed turn
+- `compaction` and `bridge` metadata for the completed turn
 
 ## Streaming
 
-The library exposes managed streaming for both plain text and structured generation. Partial events stream during generation, and one final completion event includes `budget`, `compaction`, and `bridge`. Assistant turns are only persisted on successful completion.
+The library streams both plain text and structured generation through the session. Partial events stream during generation, and one final completion event includes the persisted result plus `compaction` and `bridge` metadata. Assistant turns are only persisted on successful completion.
 
 ```swift
-for try await event in await kit.streamText(
-    to: "Write a short project status update.",
-    threadID: "demo-thread"
-) {
+for try await event in session.stream("Write a short project status update.") {
     switch event {
     case .partial(let text):
         print("partial:", text)
     case .completed(let response):
         print("final:", response.text)
-        print("budget:", response.budget.projectedTotalTokens)
+        print("bridged:", response.metadata.bridge != nil)
     }
 }
 ```
 
 ```swift
-for try await event in await kit.streamManaged(
-    to: "Summarize the project state.",
-    generating: ProjectSummary.self,
-    threadID: "demo-thread"
+for try await event in session.stream(
+    "Summarize the project state.",
+    as: ProjectSummary.self
 ) {
     switch event {
-    case .partial(let content, _):
+    case .partial(let content):
         print("partial headline:", content.headline)
     case .completed(let response):
-        print("final tasks:", response.content.openTasks)
+        print("final tasks:", response.value.openTasks)
     }
 }
 ```
@@ -162,9 +142,9 @@ let kit = LanguageModelContextKit(
     )
 )
 
-try await kit.openThread(
+let session = try await kit.session(
     id: "project-thread",
-    configuration: ThreadConfiguration(
+    configuration: SessionConfiguration(
         instructions: "Track project facts, decisions, and open tasks."
     )
 )
@@ -175,17 +155,17 @@ for prompt in [
     "TODO: write integration tests.",
     "Summarize what still needs to be done."
 ] {
-    let response = try await kit.respond(to: prompt, threadID: "project-thread")
-    print(response.text)
+    let response = try await session.respond(prompt)
+    print(response)
 }
 ```
 
-When the estimated budget crosses the configured soft limit, the package compacts older context and bridges to a fresh Foundation Models session as needed.
+When the internal budget crosses the configured soft limit, the package compacts older context and bridges to a fresh Foundation Models session as needed.
 
 ## Manual Compaction
 
 ```swift
-let report = try await kit.compact(threadID: "project-thread")
+let report = try await session.maintenance.compact()
 print(report.reducersApplied)
 print(report.summaryCreated)
 ```
@@ -193,7 +173,7 @@ print(report.summaryCreated)
 ## Diagnostics
 
 ```swift
-if let diagnostics = await kit.diagnostics(threadID: "project-thread") {
+if let diagnostics = await session.inspection.diagnostics() {
     print("Window:", diagnostics.windowIndex)
     print("Turns:", diagnostics.turnCount)
     print("Durable memories:", diagnostics.durableMemoryCount)
@@ -224,48 +204,49 @@ let kit = LanguageModelContextKit(
 
 ## Importing Existing State
 
-You can bootstrap a logical thread from app-owned history before the next model call:
+You can bootstrap a session from app-owned history before the next model call:
 
 ```swift
-try await kit.importThread(
+let session = try await kit.session(
     id: "migrated-thread",
-    configuration: ThreadConfiguration(
+    configuration: SessionConfiguration(
         instructions: "Preserve prior user constraints and decisions."
-    ),
-    turns: existingTurns,
+    )
+)
+
+try await session.maintenance.importHistory(
+    existingTurns,
     durableMemory: existingDurableMemory,
     replaceExisting: true
 )
 ```
 
-Imported turns are sorted by `createdAt`, existing `windowIndex` values are preserved, persisted durable memory is written through the configured memory store, and any live in-memory session is invalidated so the next call rehydrates from imported state.
-With `replaceExisting: false`, imported state is merged into the existing thread and repeated imports of the same turns or durable memories are deduplicated.
+Imported turns are sorted by `createdAt`, existing `windowIndex` values are preserved, persisted durable memory is written through the configured memory store, and any live in-memory model session is invalidated so the next call rehydrates from imported state. With `replaceExisting: false`, imported state is merged into the existing session and repeated imports of the same turns or durable memories are deduplicated.
 
 ## External Mutations and Inspection
 
 Apps can append externally produced context without going through `respond(...)`:
 
 ```swift
-try await kit.appendTurns(toolTurns, threadID: "demo-thread")
-try await kit.appendMemories(memoryRecords, threadID: "demo-thread")
+try await session.maintenance.appendTurns(toolTurns)
+try await session.maintenance.appendMemory(memoryRecords)
 
-let state = try await kit.threadState(threadID: "demo-thread")
-let memories = try await kit.durableMemories(threadID: "demo-thread")
+let turns = try await session.inspection.history()
+let memories = try await session.inspection.durableMemory()
 
-print(state.turns.count)
+print(turns.count)
 print(memories.count)
 ```
 
-Appending turns or memories does not trigger compaction. It updates persisted thread timestamps and invalidates any live session so the next generation request rehydrates cleanly. `appendMemories` deduplicates by `kind + text` by default; pass `deduplicate: false` if you need exact duplicates preserved.
+Appending turns or memories does not trigger compaction. It updates persisted session state and invalidates any live model session so the next generation request rehydrates cleanly. `appendMemory` deduplicates by `kind + text` by default; pass `deduplicate: false` if you need exact duplicates preserved.
 
 ## Budgeting Notes
 
-`estimateBudget` and the managed response metadata use the package token counter. When Foundation Models does not expose a runtime context-window value, LMCK uses `BudgetPolicy.defaultContextWindowTokens` as the window-size fallback for planning and diagnostics.
+LMCK budgets internally before each request. When Foundation Models does not expose a runtime context-window value, LMCK uses `BudgetPolicy.defaultContextWindowTokens` as the window-size fallback for planning and diagnostics.
 
 ## Notes
 
-- Call `openThread` after app launch or resume for any thread that uses tools, because tool implementations are runtime-only.
-- After relaunch, call `openThread` again for persisted threads so runtime configuration such as tools is reattached before the next model request.
+- Recreate a session with the same `id` after app launch or resume for any persisted conversation that uses tools, because tool implementations are runtime-only.
+- After relaunch, call `kit.session(id:configuration:)` again for persisted sessions so runtime configuration such as tools is reattached before the next model request.
 - The library persists normalized turns and durable memories, not Foundation transcript objects.
-- Structured calls persist assistant text from `transcriptRenderer(content)` when provided; otherwise they persist the adapter transcript text.
 - Exact budgeting still falls back to heuristics today because Foundation Models does not currently expose public token-count or context-window APIs that the package can bind to.
